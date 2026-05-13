@@ -1,0 +1,721 @@
+"""
+Risk monitor: fetches positions from Hyperliquid, Binance, Bybit, OKX and
+writes a snapshot to the 'perp_monitor' tab of the 'Portfolios' Google Sheet.
+
+Jenkins setup:
+  Required environment variables (inject via Credentials Binding plugin):
+    BYBIT_KEY, BYBIT_SECRET
+    BINANCE_KEY, BINANCE_SECRET
+    OKX_KEY, OKX_SECRET, OKX_PASS
+    GOOGLE_APPLICATION_CREDENTIALS  -- path to the service-account JSON file
+
+  Optional environment variables:
+    HL_USER          -- Hyperliquid wallet to monitor (defaults to baked-in value)
+    SHEET_NAME       -- default "Portfolios"
+    TAB_RISK         -- default "perp_monitor"
+
+Exit codes:
+  0  -- snapshot written successfully
+  1  -- sheet write failed
+  2  -- all four exchange fetches failed (nothing to write)
+"""
+
+import os
+import sys
+import requests
+import time
+import hmac
+import hashlib
+import base64
+from datetime import datetime, timezone
+from typing import Union, Dict, Any
+from urllib.parse import urlencode
+
+import gspread
+from google.oauth2.service_account import Credentials
+
+
+# ============================================================
+#  CONFIG (all secrets via env)
+# ============================================================
+def _required_env(name: str) -> str:
+    val = os.environ.get(name)
+    if not val:
+        print(f"[FATAL] Required environment variable {name} is not set.", file=sys.stderr)
+        sys.exit(2)
+    return val
+
+
+BYBIT_API_KEY = _required_env("BYBIT_KEY")
+BYBIT_API_SECRET = _required_env("BYBIT_SECRET")
+BINANCE_KEY = _required_env("BINANCE_KEY")
+BINANCE_SECRET = _required_env("BINANCE_SECRET")
+OKX_API_KEY = _required_env("OKX_KEY")
+OKX_API_SECRET = _required_env("OKX_SECRET")
+OKX_PASSPHRASE = _required_env("OKX_PASS")
+GOOGLE_CREDS_FILE = _required_env("GOOGLE_APPLICATION_CREDENTIALS")
+
+HL_USER = os.environ.get("HL_USER", "0x64Ffaa34FffC59e84D3E7731812b3A63397Af7c6")
+SHEET_NAME = os.environ.get("SHEET_NAME", "Portfolios")
+TAB_RISK = os.environ.get("TAB_RISK", "perp_monitor")
+
+HL_INFO_URL = "https://api.hyperliquid.xyz/info"
+LIQ_DISTANCE_THRESHOLD_PCT = 25.0
+TARGET_LIQ_DISTANCE_PCT = 20.0
+
+BYBIT_BASE_URL = "https://api.bybit.com"
+BYBIT_RECV_WINDOW = "5000"
+
+OKX_BASE_URL = "https://www.okx.com"
+OKX_MGN_RATIO_FLOOR = 1.5
+OKX_MGN_RATIO_TARGET = 1.33
+
+GSHEET_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+
+def _log(msg: str) -> None:
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    print(f"[{ts}] {msg}", flush=True)
+
+
+def _removable_isolated_position(direction: str, size: float, mark: float, liq: float) -> float:
+    if size == 0 or mark <= 0 or liq <= 0:
+        return 0.0
+    if direction == "LONG":
+        target_liq = mark * (1 - TARGET_LIQ_DISTANCE_PCT / 100.0)
+        if target_liq <= liq:
+            return 0.0
+        return (target_liq - liq) * abs(size)
+    else:
+        target_liq = mark * (1 + TARGET_LIQ_DISTANCE_PCT / 100.0)
+        if target_liq >= liq:
+            return 0.0
+        return (liq - target_liq) * abs(size)
+
+
+def _removable_cross_binding(cross_positions: list, account_equity: float) -> float:
+    if not cross_positions or account_equity <= 0:
+        return 0.0
+    target = TARGET_LIQ_DISTANCE_PCT / 100.0
+    per_pos_caps = []
+    for p in cross_positions:
+        size = p["size"]
+        mark = p["mark"]
+        liq = p["liq"]
+        if size == 0 or mark <= 0 or liq <= 0:
+            continue
+        current_dist = abs(mark - liq) / mark
+        if current_dist <= target:
+            return 0.0
+        max_delta = (current_dist - target) * mark * abs(size)
+        per_pos_caps.append(max_delta)
+    if not per_pos_caps:
+        return 0.0
+    return max(0.0, min(min(per_pos_caps), account_equity))
+
+
+def get_hl_positions():
+    timeout, retries, backoff_s = 20, 5, 0.4
+    session = requests.Session()
+    session.headers.update({"Content-Type": "application/json"})
+
+    def _post(payload: dict) -> Union[list, dict]:
+        for attempt in range(retries):
+            try:
+                resp = session.post(HL_INFO_URL, json=payload, timeout=timeout)
+                resp.raise_for_status()
+                return resp.json()
+            except (requests.RequestException, ValueError) as exc:
+                if attempt == retries - 1:
+                    raise
+                time.sleep(backoff_s * (2 ** attempt))
+
+    state = _post({"type": "clearinghouseState", "user": HL_USER})
+    meta_resp = _post({"type": "metaAndAssetCtxs"})
+    universe = meta_resp[0]["universe"]
+    ctxs = meta_resp[1]
+    mark_prices = {asset["name"]: float(ctx["markPx"]) for asset, ctx in zip(universe, ctxs)}
+
+    positions = []
+    for ap in state.get("assetPositions", []):
+        pos = ap.get("position", {})
+        if float(pos.get("szi", "0")) == 0:
+            continue
+        positions.append(pos)
+
+    long_delta = short_delta = 0.0
+    position_rows = []
+    isolated_removables = []
+    cross_position_inputs = []
+
+    for pos in positions:
+        coin = pos["coin"]
+        szi = float(pos["szi"])
+        direction = "LONG" if szi > 0 else "SHORT"
+        mark_px = mark_prices.get(coin) or 0.0
+        signed_notional = szi * mark_px
+        if signed_notional > 0:
+            long_delta += signed_notional
+        else:
+            short_delta += signed_notional
+
+        liq_px_str = pos.get("liquidationPx")
+        liq_px = float(liq_px_str) if liq_px_str else None
+        dist_pct = abs((mark_px - liq_px) / mark_px) * 100 if (liq_px and mark_px) else None
+
+        lev = pos.get("leverage", {}) or {}
+        is_isolated = lev.get("type") == "isolated"
+        margin_mode = lev.get("type", "unknown")
+
+        iso_rem = None
+        if is_isolated and liq_px and mark_px:
+            iso_rem = _removable_isolated_position(direction, szi, mark_px, liq_px)
+            isolated_removables.append((coin, iso_rem))
+        elif (not is_isolated) and liq_px and mark_px:
+            cross_position_inputs.append({"name": coin, "size": szi, "mark": mark_px, "liq": liq_px})
+
+        position_rows.append({
+            "exchange": "Hyperliquid", "symbol": coin, "direction": direction,
+            "size": abs(szi), "notional": signed_notional, "mark": mark_px,
+            "liq": liq_px, "dist_pct": dist_pct, "margin_mode": margin_mode,
+            "isolated_removable": iso_rem,
+        })
+
+    net_delta = long_delta + short_delta
+    gross_notional = long_delta + abs(short_delta)
+    margin = state.get("marginSummary", {})
+    try:
+        account_equity = float(margin.get("accountValue") or 0)
+    except (TypeError, ValueError):
+        account_equity = 0.0
+    try:
+        withdrawable = float(state.get("withdrawable") or 0)
+    except (TypeError, ValueError):
+        withdrawable = 0.0
+    hl_leverage = gross_notional / account_equity if account_equity > 0 else 0.0
+
+    measurable = [r for r in position_rows if r["dist_pct"] is not None]
+    if not positions:
+        excess = True
+    elif not measurable:
+        excess = False
+    else:
+        excess = min(r["dist_pct"] for r in measurable) > LIQ_DISTANCE_THRESHOLD_PCT
+
+    iso_sum = sum(max(amt, 0.0) for _, amt in isolated_removables)
+    cross_cap = _removable_cross_binding(cross_position_inputs, account_equity)
+    pos_constrained = iso_sum + cross_cap
+    removable_total = max(0.0, min(pos_constrained, withdrawable)) if withdrawable > 0 else pos_constrained
+
+    return {
+        "exchange": "Hyperliquid", "currency": "USDC", "positions_count": len(positions),
+        "position_rows": position_rows, "long_delta": long_delta, "short_delta": short_delta,
+        "net_delta": net_delta, "gross_notional": gross_notional, "leverage": hl_leverage,
+        "account_equity": account_equity, "withdrawable": withdrawable,
+        "excess_collateral": excess, "removable_total": removable_total, "mgn_ratio": None,
+    }
+
+
+def get_binance_positions():
+    base_url = "https://fapi.binance.com"
+    timeout = 10
+
+    def _signed_get(path: str) -> Union[list, dict]:
+        params = {"timestamp": int(time.time() * 1000), "recvWindow": 5000}
+        qs = urlencode(params)
+        params["signature"] = hmac.new(
+            BINANCE_SECRET.encode("utf-8"), qs.encode("utf-8"), digestmod=hashlib.sha256
+        ).hexdigest()
+        headers = {"X-MBX-APIKEY": BINANCE_KEY}
+        r = requests.get(base_url + path, params=params, headers=headers, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+
+    all_positions = _signed_get("/fapi/v2/positionRisk")
+    positions = [p for p in all_positions if float(p.get("positionAmt", "0")) != 0]
+
+    long_delta = short_delta = 0.0
+    position_rows = []
+    isolated_removables = []
+    cross_position_inputs = []
+
+    for p in positions:
+        symbol = p["symbol"]
+        amt = float(p["positionAmt"])
+        direction = "LONG" if amt > 0 else "SHORT"
+        mark = float(p["markPrice"])
+        notional = float(p.get("notional") or amt * mark)
+        liq_px = float(p["liquidationPrice"])
+        margin_type = (p.get("marginType") or "").lower()
+        is_isolated = margin_type == "isolated"
+
+        if notional > 0:
+            long_delta += notional
+        else:
+            short_delta += notional
+
+        liq_out = liq_px if liq_px != 0 else None
+        dist_pct = abs((mark - liq_px) / mark) * 100 if (liq_out and mark != 0) else None
+
+        iso_rem = None
+        if is_isolated and liq_out and mark != 0:
+            iso_rem = _removable_isolated_position(direction, amt, mark, liq_out)
+            isolated_removables.append((symbol, iso_rem))
+        elif (not is_isolated) and liq_out and mark != 0:
+            cross_position_inputs.append({"name": symbol, "size": amt, "mark": mark, "liq": liq_out})
+
+        position_rows.append({
+            "exchange": "Binance", "symbol": symbol, "direction": direction,
+            "size": abs(amt), "notional": notional, "mark": mark, "liq": liq_out,
+            "dist_pct": dist_pct, "margin_mode": margin_type or "unknown",
+            "isolated_removable": iso_rem,
+        })
+
+    net_delta = long_delta + short_delta
+    gross_notional = long_delta + abs(short_delta)
+    acct = _signed_get("/fapi/v2/account")
+    try:
+        account_equity = float(acct.get("totalMarginBalance") or 0)
+    except (TypeError, ValueError):
+        account_equity = 0.0
+    try:
+        withdrawable = float(acct.get("availableBalance") or 0)
+    except (TypeError, ValueError):
+        withdrawable = 0.0
+    bn_leverage = gross_notional / account_equity if account_equity > 0 else 0.0
+
+    measurable = [r for r in position_rows if r["dist_pct"] is not None]
+    if not positions:
+        excess = True
+    elif not measurable:
+        excess = False
+    else:
+        excess = min(r["dist_pct"] for r in measurable) > LIQ_DISTANCE_THRESHOLD_PCT
+
+    iso_sum = sum(max(amt, 0.0) for _, amt in isolated_removables)
+    cross_cap = _removable_cross_binding(cross_position_inputs, account_equity)
+    pos_constrained = iso_sum + cross_cap
+    removable_total = max(0.0, min(pos_constrained, withdrawable)) if withdrawable > 0 else pos_constrained
+
+    return {
+        "exchange": "Binance", "currency": "USDT", "positions_count": len(positions),
+        "position_rows": position_rows, "long_delta": long_delta, "short_delta": short_delta,
+        "net_delta": net_delta, "gross_notional": gross_notional, "leverage": bn_leverage,
+        "account_equity": account_equity, "withdrawable": withdrawable,
+        "excess_collateral": excess, "removable_total": removable_total, "mgn_ratio": None,
+    }
+
+
+def _bybit_signed_get(path, params, timeout_s=10):
+    recv_window = str(BYBIT_RECV_WINDOW)
+    timestamp = str(int(time.time() * 1000))
+    query_string = urlencode(params)
+    pre_sign = timestamp + BYBIT_API_KEY + recv_window + query_string
+    signature = hmac.new(
+        BYBIT_API_SECRET.encode("utf-8"), pre_sign.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY": BYBIT_API_KEY, "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-SIGN": signature, "X-BAPI-RECV-WINDOW": recv_window,
+        "Content-Type": "application/json",
+    }
+    resp = requests.get(f"{BYBIT_BASE_URL}{path}", params=params, headers=headers, timeout=timeout_s)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("retCode") != 0:
+        raise RuntimeError(f"Bybit error {data.get('retCode')}: {data.get('retMsg')} (path={path})")
+    return data
+
+
+def _bybit_fetch_wallet(timeout=10):
+    for acct_type in ("UNIFIED", "CONTRACT"):
+        try:
+            wd = _bybit_signed_get("/v5/account/wallet-balance", {"accountType": acct_type}, timeout_s=timeout)
+        except RuntimeError:
+            continue
+        wallet_list = wd.get("result", {}).get("list", []) or []
+        if wallet_list:
+            entry = wallet_list[0]
+            entry["_accountType"] = acct_type
+            return entry
+    return {}
+
+
+def get_bybit_positions():
+    timeout = 10
+    positions = []
+    for settle in ("USDT", "USDC"):
+        params: Dict[str, Any] = {"category": "linear", "settleCoin": settle, "limit": "200"}
+        cursor = None
+        while True:
+            if cursor:
+                params["cursor"] = cursor
+            else:
+                params.pop("cursor", None)
+            data = _bybit_signed_get("/v5/position/list", params, timeout_s=timeout)
+            result = data.get("result", {})
+            for p in result.get("list", []) or []:
+                if float(p.get("size", "0")) != 0:
+                    p["_settleCoin"] = settle
+                    positions.append(p)
+            cursor = result.get("nextPageCursor")
+            if not cursor:
+                break
+
+    long_delta = short_delta = 0.0
+    position_rows = []
+    isolated_removables = []
+    cross_position_inputs = []
+
+    for p in positions:
+        symbol = p["symbol"]
+        side = p.get("side", "")
+        size = float(p.get("size", "0"))
+        mark = float(p.get("markPrice", "0") or 0)
+        pos_value = float(p.get("positionValue", "0") or 0)
+        liq_px_str = p.get("liqPrice", "") or ""
+        direction = "LONG" if side == "Buy" else "SHORT"
+        signed_notional = pos_value if side == "Buy" else -pos_value
+        signed_size = size if side == "Buy" else -size
+
+        if signed_notional > 0:
+            long_delta += signed_notional
+        else:
+            short_delta += signed_notional
+
+        try:
+            is_isolated = int(p.get("tradeMode", 0)) == 1
+        except (TypeError, ValueError):
+            is_isolated = False
+        margin_mode = "isolated" if is_isolated else "cross"
+
+        if liq_px_str and liq_px_str not in ("", "0") and mark != 0:
+            liq_px = float(liq_px_str)
+            dist_pct = abs((mark - liq_px) / mark) * 100
+        else:
+            liq_px = None
+            dist_pct = None
+
+        iso_rem = None
+        if is_isolated and liq_px and mark != 0:
+            iso_rem = _removable_isolated_position(direction, signed_size, mark, liq_px)
+            isolated_removables.append((symbol, iso_rem))
+        elif (not is_isolated) and liq_px and mark != 0:
+            cross_position_inputs.append({"name": symbol, "size": signed_size, "mark": mark, "liq": liq_px})
+
+        position_rows.append({
+            "exchange": "Bybit", "symbol": symbol, "direction": direction,
+            "size": size, "notional": signed_notional, "mark": mark, "liq": liq_px,
+            "dist_pct": dist_pct, "margin_mode": margin_mode, "isolated_removable": iso_rem,
+        })
+
+    net_delta = long_delta + short_delta
+    gross_notional = long_delta + abs(short_delta)
+    acct = _bybit_fetch_wallet(timeout=timeout)
+    try:
+        account_equity = float(acct.get("totalEquity") or 0)
+    except (TypeError, ValueError):
+        account_equity = 0.0
+    try:
+        withdrawable = float(acct.get("totalAvailableBalance") or 0)
+    except (TypeError, ValueError):
+        withdrawable = 0.0
+    bb_leverage = gross_notional / account_equity if account_equity > 0 else 0.0
+
+    measurable = [r for r in position_rows if r["dist_pct"] is not None]
+    if not positions:
+        excess = True
+    elif not measurable:
+        excess = False
+    else:
+        excess = min(r["dist_pct"] for r in measurable) > LIQ_DISTANCE_THRESHOLD_PCT
+
+    iso_sum = sum(max(amt, 0.0) for _, amt in isolated_removables)
+    cross_cap = _removable_cross_binding(cross_position_inputs, account_equity)
+    pos_constrained = iso_sum + cross_cap
+    removable_total = max(0.0, min(pos_constrained, withdrawable)) if withdrawable > 0 else pos_constrained
+
+    return {
+        "exchange": "Bybit", "currency": "USD", "positions_count": len(positions),
+        "position_rows": position_rows, "long_delta": long_delta, "short_delta": short_delta,
+        "net_delta": net_delta, "gross_notional": gross_notional, "leverage": bb_leverage,
+        "account_equity": account_equity, "withdrawable": withdrawable,
+        "excess_collateral": excess, "removable_total": removable_total, "mgn_ratio": None,
+    }
+
+
+def _okx_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _okx_signed_get(path, params=None, timeout_s=20):
+    params = params or {}
+    query = urlencode(params)
+    request_path = f"{path}?{query}" if query else path
+    timestamp = _okx_timestamp()
+    prehash = f"{timestamp}GET{request_path}"
+    sign = base64.b64encode(
+        hmac.new(OKX_API_SECRET.encode("utf-8"), prehash.encode("utf-8"), hashlib.sha256).digest()
+    ).decode("utf-8")
+    headers = {
+        "OK-ACCESS-KEY": OKX_API_KEY, "OK-ACCESS-SIGN": sign,
+        "OK-ACCESS-TIMESTAMP": timestamp, "OK-ACCESS-PASSPHRASE": OKX_PASSPHRASE,
+        "Content-Type": "application/json",
+    }
+    r = requests.get(f"{OKX_BASE_URL}{request_path}", headers=headers, timeout=timeout_s)
+    try:
+        data = r.json()
+    except ValueError:
+        r.raise_for_status()
+        raise RuntimeError(f"OKX non-JSON response: {r.text}")
+    if r.status_code != 200:
+        raise RuntimeError(f"OKX HTTP error ({r.status_code}): {data}")
+    if isinstance(data, dict) and data.get("code") not in (None, "0"):
+        raise RuntimeError(f"OKX API error: {data}")
+    return data
+
+
+def get_okx_positions():
+    timeout = 20
+    pos_resp = _okx_signed_get("/api/v5/account/positions", params={}, timeout_s=timeout)
+    raw_positions = pos_resp.get("data", []) or []
+    positions = [p for p in raw_positions if float(p.get("pos", "0") or 0) != 0]
+
+    long_delta = short_delta = 0.0
+    position_rows = []
+    isolated_removables = []
+    cross_pos_count = 0
+
+    for p in positions:
+        inst_id = p.get("instId", "")
+        pos_qty = float(p.get("pos", "0") or 0)
+        pos_side = (p.get("posSide", "") or "").lower()
+        if pos_side == "long":
+            direction, signed_size = "LONG", abs(pos_qty)
+        elif pos_side == "short":
+            direction, signed_size = "SHORT", -abs(pos_qty)
+        else:
+            direction = "LONG" if pos_qty > 0 else "SHORT"
+            signed_size = pos_qty
+
+        mark = float(p.get("markPx", "0") or 0)
+        notional_abs = float(p.get("notionalUsd", "0") or 0)
+        signed_notional = notional_abs if direction == "LONG" else -notional_abs
+        liq_px_str = p.get("liqPx", "") or ""
+        mgn_mode = (p.get("mgnMode", "") or "").lower()
+        is_isolated = mgn_mode == "isolated"
+
+        if signed_notional > 0:
+            long_delta += signed_notional
+        else:
+            short_delta += signed_notional
+
+        if is_isolated and liq_px_str and liq_px_str not in ("", "0") and mark != 0:
+            liq_px = float(liq_px_str)
+            dist_pct = abs((mark - liq_px) / mark) * 100
+            iso_rem = _removable_isolated_position(direction, signed_size, mark, liq_px)
+            isolated_removables.append((inst_id, iso_rem))
+        else:
+            cross_pos_count += 1
+            liq_px = None
+            dist_pct = None
+            iso_rem = None
+
+        position_rows.append({
+            "exchange": "OKX", "symbol": inst_id, "direction": direction,
+            "size": abs(pos_qty), "notional": signed_notional, "mark": mark,
+            "liq": liq_px, "dist_pct": dist_pct, "margin_mode": mgn_mode or "unknown",
+            "isolated_removable": iso_rem,
+        })
+
+    net_delta = long_delta + short_delta
+    gross_notional = long_delta + abs(short_delta)
+    acct_resp = _okx_signed_get("/api/v5/account/balance", params={}, timeout_s=timeout)
+    acct_data = acct_resp.get("data", []) or []
+    acct = acct_data[0] if acct_data else {}
+
+    def _f(v):
+        try:
+            return float(v) if v is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    total_eq = _f(acct.get("totalEq"))
+    adj_eq = _f(acct.get("adjEq"))
+    mmr = _f(acct.get("mmr"))
+    mgn_ratio = _f(acct.get("mgnRatio"))
+    okx_leverage = gross_notional / total_eq if total_eq > 0 else 0.0
+
+    iso_rows = [r for r in position_rows if r["dist_pct"] is not None]
+    if not positions:
+        excess = True
+    else:
+        iso_ok = all(r["dist_pct"] > LIQ_DISTANCE_THRESHOLD_PCT for r in iso_rows) if iso_rows else True
+        cross_ok = (cross_pos_count == 0) or (mgn_ratio > OKX_MGN_RATIO_FLOOR)
+        excess = iso_ok and cross_ok
+
+    iso_sum = sum(max(amt, 0.0) for _, amt in isolated_removables)
+    if cross_pos_count > 0 and mgn_ratio > OKX_MGN_RATIO_TARGET:
+        cross_removable = max(0.0, adj_eq - mmr * OKX_MGN_RATIO_TARGET)
+    else:
+        cross_removable = 0.0
+    wd_cap = adj_eq if adj_eq > 0 else float("inf")
+    removable_total = max(0.0, min(iso_sum + cross_removable, wd_cap))
+
+    return {
+        "exchange": "OKX", "currency": "USD", "positions_count": len(positions),
+        "position_rows": position_rows, "long_delta": long_delta, "short_delta": short_delta,
+        "net_delta": net_delta, "gross_notional": gross_notional, "leverage": okx_leverage,
+        "account_equity": total_eq, "withdrawable": adj_eq,
+        "excess_collateral": excess, "removable_total": removable_total, "mgn_ratio": mgn_ratio,
+    }
+
+
+# ============================================================
+#  GOOGLE SHEETS WRITER
+# ============================================================
+def _get_or_create_tab(spreadsheet, title: str):
+    try:
+        return spreadsheet.worksheet(title)
+    except gspread.WorksheetNotFound:
+        return spreadsheet.add_worksheet(title=title, rows=200, cols=20)
+
+
+def _fmt_num(v, decimals=2):
+    if v is None:
+        return ""
+    try:
+        return round(float(v), decimals)
+    except (TypeError, ValueError):
+        return v
+
+
+def write_to_sheet(results: list) -> None:
+    creds = Credentials.from_service_account_file(GOOGLE_CREDS_FILE, scopes=GSHEET_SCOPES)
+    gc = gspread.authorize(creds)
+    sh = gc.open(SHEET_NAME)
+    ws = _get_or_create_tab(sh, TAB_RISK)
+    ws.clear()
+
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    rows = []
+    rows.append(["Risk monitor snapshot", ts])
+    rows.append([])
+    rows.append(["Per-Exchange Summary"])
+    rows.append([
+        "Exchange", "Positions", "Excess Collat",
+        "Removable", "Currency", "Leverage",
+        "Gross Notional", "Net Delta",
+        "Account Equity", "Withdrawable / adjEq", "OKX mgnRatio",
+    ])
+    for r in results:
+        rows.append([
+            r["exchange"], r["positions_count"],
+            "YES" if r["excess_collateral"] else "NO",
+            _fmt_num(r["removable_total"]), r["currency"],
+            _fmt_num(r["leverage"], 4), _fmt_num(r["gross_notional"]),
+            _fmt_num(r["net_delta"]), _fmt_num(r["account_equity"]),
+            _fmt_num(r["withdrawable"]),
+            _fmt_num(r["mgn_ratio"], 4) if r["mgn_ratio"] is not None else "",
+        ])
+
+    rows.append([])
+    rows.append(["Per-Position Detail"])
+    rows.append([
+        "Exchange", "Symbol", "Direction",
+        "Size", "Notional (signed)", "Mark", "Liq Price",
+        "Dist to Liq %", "Margin Mode", "Isolated Removable",
+    ])
+    all_positions = []
+    for r in results:
+        all_positions.extend(r["position_rows"])
+
+    def _sort_key(p):
+        dist = p["dist_pct"]
+        return (p["exchange"], 0 if dist is not None else 1, dist if dist is not None else 0)
+
+    for p in sorted(all_positions, key=_sort_key):
+        rows.append([
+            p["exchange"], p["symbol"], p["direction"],
+            _fmt_num(p["size"], 6), _fmt_num(p["notional"]),
+            _fmt_num(p["mark"], 6),
+            _fmt_num(p["liq"], 6) if p["liq"] is not None else "",
+            _fmt_num(p["dist_pct"], 2) if p["dist_pct"] is not None else "",
+            p["margin_mode"] + (" (see mgnRatio)" if p["dist_pct"] is None and p["margin_mode"] == "cross" else ""),
+            _fmt_num(p["isolated_removable"]) if p["isolated_removable"] is not None else "",
+        ])
+
+    rows.append([])
+    rows.append(["Thresholds"])
+    rows.append(["Liq distance threshold", f">{LIQ_DISTANCE_THRESHOLD_PCT:.0f}%"])
+    rows.append(["Removable target buffer", f">{TARGET_LIQ_DISTANCE_PCT:.0f}%"])
+    rows.append(["OKX mgnRatio floor", f"{OKX_MGN_RATIO_FLOOR:.2f}x  (liquidates at 1.00x, OKX warns at 3.00x)"])
+    rows.append(["OKX mgnRatio target", f"{OKX_MGN_RATIO_TARGET:.2f}x"])
+
+    max_cols = max(len(row) for row in rows) if rows else 1
+    rows = [row + [""] * (max_cols - len(row)) for row in rows]
+
+    ws.update(values=rows, range_name="A1")
+    _log(f"Wrote {len(rows)} rows to '{TAB_RISK}' tab in '{SHEET_NAME}'.")
+
+
+# ============================================================
+#  MAIN
+# ============================================================
+def main() -> int:
+    results = []
+    failures = []
+
+    fetchers = [
+        ("Hyperliquid", get_hl_positions),
+        ("Binance", get_binance_positions),
+        ("Bybit", get_bybit_positions),
+        ("OKX", get_okx_positions),
+    ]
+
+    for name, fn in fetchers:
+        _log(f"Fetching {name}...")
+        try:
+            r = fn()
+            results.append(r)
+            _log(
+                f"  {name}: {r['positions_count']} positions, "
+                f"excess={r['excess_collateral']}, "
+                f"removable={r['removable_total']:,.2f} {r['currency']}, "
+                f"leverage={r['leverage']:.2f}x"
+                + (f", mgnRatio={r['mgn_ratio']:.2f}x" if r['mgn_ratio'] is not None else "")
+            )
+        except Exception as exc:
+            failures.append((name, exc))
+            _log(f"  [{name} ERROR] {type(exc).__name__}: {exc}")
+
+    if not results:
+        _log("All exchange fetches failed; nothing to write. Exiting with code 2.")
+        return 2
+
+    _log("Writing to Google Sheet...")
+    try:
+        write_to_sheet(results)
+    except Exception as exc:
+        _log(f"[SHEET WRITE ERROR] {type(exc).__name__}: {exc}")
+        return 1
+
+    if failures:
+        _log(
+            f"Snapshot written, but {len(failures)} exchange fetch(es) failed: "
+            f"{', '.join(name for name, _ in failures)}. "
+            "Sheet reflects only successful exchanges."
+        )
+        # Still exit 0; partial data is better than no data, and Jenkins can
+        # alert on the log if needed. Change to `return 1` if partial = fail.
+
+    _log("Done.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
