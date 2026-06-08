@@ -10,7 +10,7 @@ Jenkins setup:
     GOOGLE_APPLICATION_CREDENTIALS  -- path to the service-account JSON file
 
   Optional environment variables:
-    HL_USER          -- Hyperliquid wallet to monitor (defaults to baked-in value)
+    HL_USER          -- Hyperliquid wallet to monitor
     SHEET_NAME       -- default "Portfolios"
     TAB_RISK         -- default "perp_monitor"
 
@@ -69,6 +69,11 @@ BYBIT_RECV_WINDOW = "5000"
 OKX_BASE_URL = "https://www.okx.com"
 OKX_MGN_RATIO_FLOOR = 1.5
 OKX_MGN_RATIO_TARGET = 1.33
+
+# Same framing as OKX, applied to Binance account-level marginBalance/maintMargin.
+# Used as the fallback when Binance cross positions don't return a liq price.
+BN_MGN_RATIO_FLOOR = 1.5
+BN_MGN_RATIO_TARGET = 1.33
 
 GSHEET_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -208,7 +213,8 @@ def get_hl_positions():
     iso_sum = sum(max(amt, 0.0) for _, amt in isolated_removables)
     cross_cap = _removable_cross_binding(cross_position_inputs, account_equity)
     pos_constrained = iso_sum + cross_cap
-    removable_total = max(0.0, min(pos_constrained, withdrawable)) if withdrawable > 0 else pos_constrained
+    # withdrawable=0 means truly can't pull anything out; always apply the cap.
+    removable_total = max(0.0, min(pos_constrained, withdrawable))
 
     return {
         "exchange": "Hyperliquid", "currency": "USDC", "positions_count": len(positions),
@@ -285,27 +291,63 @@ def get_binance_positions():
         withdrawable = float(acct.get("availableBalance") or 0)
     except (TypeError, ValueError):
         withdrawable = 0.0
+    try:
+        maint_margin = float(acct.get("totalMaintMargin") or 0)
+    except (TypeError, ValueError):
+        maint_margin = 0.0
+
+    # Account-level margin ratio: marginBalance / maintMargin.
+    # Mirrors OKX mgnRatio. Liquidation at 1.0x. Used as a fallback for cross
+    # positions where Binance returns liquidationPrice=0 (large cushion case).
+    bn_mgn_ratio = account_equity / maint_margin if maint_margin > 0 else float("inf")
+
     bn_leverage = gross_notional / account_equity if account_equity > 0 else 0.0
 
+    # Count cross positions without a per-position liq price. For these,
+    # account-level mgnRatio is the only safety signal we have.
+    cross_no_liq_count = sum(
+        1 for r in position_rows
+        if r["dist_pct"] is None and r["margin_mode"] != "isolated"
+    )
+
+    # Hybrid excess: per-position dist OK AND account-level mgnRatio OK.
     measurable = [r for r in position_rows if r["dist_pct"] is not None]
     if not positions:
         excess = True
-    elif not measurable:
-        excess = False
     else:
-        excess = min(r["dist_pct"] for r in measurable) > LIQ_DISTANCE_THRESHOLD_PCT
+        if measurable:
+            per_pos_ok = min(r["dist_pct"] for r in measurable) > LIQ_DISTANCE_THRESHOLD_PCT
+        else:
+            per_pos_ok = True
+        if cross_no_liq_count > 0:
+            account_ok = bn_mgn_ratio > BN_MGN_RATIO_FLOOR
+        else:
+            account_ok = True
+        excess = per_pos_ok and account_ok
 
+    # Removable: isolated sum + cross binding cap + (if cross-without-liq
+    # positions exist) account-level cap from mgnRatio target.
     iso_sum = sum(max(amt, 0.0) for _, amt in isolated_removables)
     cross_cap = _removable_cross_binding(cross_position_inputs, account_equity)
-    pos_constrained = iso_sum + cross_cap
-    removable_total = max(0.0, min(pos_constrained, withdrawable)) if withdrawable > 0 else pos_constrained
+
+    if cross_no_liq_count > 0:
+        if bn_mgn_ratio > BN_MGN_RATIO_TARGET:
+            account_cap = max(0.0, account_equity - maint_margin * BN_MGN_RATIO_TARGET)
+        else:
+            account_cap = 0.0
+        pos_constrained = iso_sum + cross_cap + account_cap
+    else:
+        pos_constrained = iso_sum + cross_cap
+
+    removable_total = max(0.0, min(pos_constrained, withdrawable))
 
     return {
         "exchange": "Binance", "currency": "USDT", "positions_count": len(positions),
         "position_rows": position_rows, "long_delta": long_delta, "short_delta": short_delta,
         "net_delta": net_delta, "gross_notional": gross_notional, "leverage": bn_leverage,
         "account_equity": account_equity, "withdrawable": withdrawable,
-        "excess_collateral": excess, "removable_total": removable_total, "mgn_ratio": None,
+        "excess_collateral": excess, "removable_total": removable_total,
+        "mgn_ratio": bn_mgn_ratio if bn_mgn_ratio != float("inf") else None,
     }
 
 
@@ -436,7 +478,8 @@ def get_bybit_positions():
     iso_sum = sum(max(amt, 0.0) for _, amt in isolated_removables)
     cross_cap = _removable_cross_binding(cross_position_inputs, account_equity)
     pos_constrained = iso_sum + cross_cap
-    removable_total = max(0.0, min(pos_constrained, withdrawable)) if withdrawable > 0 else pos_constrained
+    # withdrawable=0 means truly nothing to pull out; always apply the cap.
+    removable_total = max(0.0, min(pos_constrained, withdrawable))
 
     return {
         "exchange": "Bybit", "currency": "USD", "positions_count": len(positions),
@@ -610,7 +653,7 @@ def write_to_sheet(results: list) -> None:
         "Exchange", "Positions", "Excess Collat",
         "Removable", "Currency", "Leverage",
         "Gross Notional", "Net Delta",
-        "Account Equity", "Withdrawable / adjEq", "OKX mgnRatio",
+        "Account Equity", "Withdrawable / adjEq", "Account mgnRatio",
     ])
     for r in results:
         rows.append([
@@ -655,6 +698,8 @@ def write_to_sheet(results: list) -> None:
     rows.append(["Removable target buffer", f">{TARGET_LIQ_DISTANCE_PCT:.0f}%"])
     rows.append(["OKX mgnRatio floor", f"{OKX_MGN_RATIO_FLOOR:.2f}x  (liquidates at 1.00x, OKX warns at 3.00x)"])
     rows.append(["OKX mgnRatio target", f"{OKX_MGN_RATIO_TARGET:.2f}x"])
+    rows.append(["Binance mgnRatio floor", f"{BN_MGN_RATIO_FLOOR:.2f}x  (for cross positions without per-position liq prices)"])
+    rows.append(["Binance mgnRatio target", f"{BN_MGN_RATIO_TARGET:.2f}x"])
 
     max_cols = max(len(row) for row in rows) if rows else 1
     rows = [row + [""] * (max_cols - len(row)) for row in rows]
@@ -710,8 +755,6 @@ def main() -> int:
             f"{', '.join(name for name, _ in failures)}. "
             "Sheet reflects only successful exchanges."
         )
-        # Still exit 0; partial data is better than no data, and Jenkins can
-        # alert on the log if needed. Change to `return 1` if partial = fail.
 
     _log("Done.")
     return 0
