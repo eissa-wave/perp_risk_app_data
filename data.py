@@ -98,9 +98,9 @@ FUNDING_START_MS = int(
 # blank annualized column. Update when entering/rolling a new strategy.
 STRATEGY_START_DATES = {
     # "TICKER": "YYYY-MM-DD",
-    "XMR": "2026-06-08",
-    "VVV": "2026-06-09",
-    "CL": "2026-06-09",
+    "XMR": "2026-05-04",
+    "VVV": "2026-05-20",
+    "CL": "2026-06-08",
 }
 
 GSHEET_SCOPES = [
@@ -1006,7 +1006,6 @@ def write_to_sheet(results: list) -> None:
     rows.append(["Binance mgnRatio target", f"{BN_MGN_RATIO_TARGET:.2f}x"])
     _fund_since = datetime.fromtimestamp(FUNDING_START_MS / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     rows.append(["Funding window", f"collected since {_fund_since}"])
-    rows.append(["Funding note", "Bybit value is curRealisedPnl (funding+closed PnL+fees), not pure funding"])
     rows.append(["Strategy note", "Funding/Notional (%) = total funding / avg abs leg notional. Annualized = that % * 365/days since hardcoded start date (STRATEGY_START_DATES). Funding window must cover the start date or the annualized figure understates."])
 
     max_cols = max(len(row) for row in rows) if rows else 1
