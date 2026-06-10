@@ -930,7 +930,7 @@ def write_to_sheet(results: list) -> None:
     rows.append(["Strategy PnL (funding arb)"])
     rows.append([
         "Strategy", "Legs (venue:dir)", "Total Funding",
-        "Avg Leg Size", "Funding / Size", "Funding / Notional (bps)",
+        "Avg Leg Size", "Funding / Notional (%)",
     ])
 
     strat: dict = {}
@@ -958,14 +958,12 @@ def write_to_sheet(results: list) -> None:
         # estimated by the average of the absolute leg sizes.
         avg_size = sum(g["abs_sizes"]) / len(g["abs_sizes"]) if g["abs_sizes"] else 0.0
         avg_notional = sum(g["abs_notionals"]) / len(g["abs_notionals"]) if g["abs_notionals"] else 0.0
-        f_per_size = g["funding"] / avg_size if avg_size > 0 else None
-        f_per_notional_bps = (g["funding"] / avg_notional * 10000) if avg_notional > 0 else None
+        f_per_notional_pct = (g["funding"] / avg_notional * 100) if avg_notional > 0 else None
         rows.append([
             key, ", ".join(g["legs"]),
             _fmt_num(g["funding"]) if g["has_funding"] else "",
             _fmt_num(avg_size, 6),
-            _fmt_num(f_per_size, 8) if (f_per_size is not None and g["has_funding"]) else "",
-            _fmt_num(f_per_notional_bps, 2) if (f_per_notional_bps is not None and g["has_funding"]) else "",
+            _fmt_num(f_per_notional_pct, 4) if (f_per_notional_pct is not None and g["has_funding"]) else "",
         ])
 
     rows.append([])
@@ -979,7 +977,7 @@ def write_to_sheet(results: list) -> None:
     _fund_since = datetime.fromtimestamp(FUNDING_START_MS / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     rows.append(["Funding window", f"collected since {_fund_since}"])
     rows.append(["Funding note", "Bybit value is curRealisedPnl (funding+closed PnL+fees), not pure funding"])
-    rows.append(["Strategy note", "Funding/Size uses avg abs leg size; valid only when legs share contract units. Use Funding/Notional (bps) for cross-venue strategies (e.g. CL)."])
+    rows.append(["Strategy note", "Funding/Notional (%) = total funding / avg abs leg notional; unit-consistent across venues."])
 
     max_cols = max(len(row) for row in rows) if rows else 1
     rows = [row + [""] * (max_cols - len(row)) for row in rows]
