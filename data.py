@@ -98,9 +98,9 @@ FUNDING_START_MS = int(
 # blank annualized column. Update when entering/rolling a new strategy.
 STRATEGY_START_DATES = {
     # "TICKER": "YYYY-MM-DD",
-    "XMR": "2026-05-04",
-    "VVV": "2026-05-20",
-    "CL": "2026-06-08",
+    "XMR": "2026-06-08",
+    "VVV": "2026-06-09",
+    "CL": "2026-06-09",
 }
 
 GSHEET_SCOPES = [
