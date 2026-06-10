@@ -80,6 +80,14 @@ OKX_MGN_RATIO_TARGET = 1.33
 BN_MGN_RATIO_FLOOR = 1.5
 BN_MGN_RATIO_TARGET = 1.33
 
+# Funding: collected funding is summed per symbol from FUNDING_START_MS to now.
+# This is funding accrued on currently-open positions over the lookback window,
+# not strictly "since this position opened". Override with an absolute ms epoch
+# via env (FUNDING_START_MS); default is a 90-day lookback.
+FUNDING_START_MS = int(
+    os.environ.get("FUNDING_START_MS", str(int((time.time() - 90 * 86400) * 1000)))
+)
+
 GSHEET_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -139,6 +147,128 @@ def _removable_cross_binding(cross_positions: list, account_equity: float) -> fl
     return max(0.0, min(min(per_pos_caps), account_equity))
 
 
+# ============================================================
+#  FUNDING (collected funding per symbol over the lookback window)
+# ============================================================
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _hl_funding_by_coin(session, dex: str, start_ms: int, end_ms: int,
+                        timeout: int, retries: int, backoff_s: float) -> dict:
+    """Sum HL funding (delta.usdc, positive = received) per coin for one dex,
+    paginating via the last event time. Keyed by raw coin name."""
+    totals: dict = {}
+    cur = start_ms
+    pages = 0
+    while pages < 10_000:
+        pages += 1
+        payload = {"type": "userFunding", "user": HL_USER, "startTime": cur, "endTime": end_ms}
+        if dex:
+            payload["dex"] = dex
+        data = _hl_post(session, payload, timeout, retries, backoff_s)
+        if not data:
+            break
+        for ev in data:
+            delta = ev.get("delta") or {}
+            coin = delta.get("coin")
+            usdc = delta.get("usdc")
+            if coin is not None and usdc is not None:
+                totals[coin] = totals.get(coin, 0.0) + float(usdc)
+        if len(data) < 500:
+            break
+        last_time = data[-1].get("time")
+        if last_time is None:
+            break
+        cur = int(last_time) + 1
+        if cur > end_ms:
+            break
+    return totals
+
+
+def _binance_funding_by_symbol(start_ms: int, end_ms: int) -> dict:
+    """Sum Binance FUNDING_FEE income (negative = paid) per symbol across all
+    symbols, paginating via the last event time."""
+    base_url = "https://fapi.binance.com"
+    path = "/fapi/v1/income"
+    limit = 1000
+    totals: dict = {}
+    current_start = start_ms
+    while True:
+        params = {
+            "timestamp": int(time.time() * 1000),
+            "incomeType": "FUNDING_FEE",
+            "limit": limit,
+            "startTime": current_start,
+            "endTime": end_ms,
+        }
+        qs = urlencode(params)
+        params["signature"] = hmac.new(
+            BINANCE_SECRET.encode("utf-8"), qs.encode("utf-8"), digestmod=hashlib.sha256
+        ).hexdigest()
+        headers = {"X-MBX-APIKEY": BINANCE_KEY}
+        r = requests.get(base_url + path, params=params, headers=headers, timeout=10)
+        r.raise_for_status()
+        batch = r.json()
+        if not batch:
+            break
+        for x in batch:
+            if x.get("incomeType") == "FUNDING_FEE":
+                sym = x.get("symbol")
+                totals[sym] = totals.get(sym, 0.0) + float(x.get("income") or 0)
+        if len(batch) < limit:
+            break
+        last_time = max(int(x["time"]) for x in batch)
+        current_start = last_time + 1
+        time.sleep(0.2)
+    return totals
+
+
+def _okx_funding_by_inst(start_ms: int, end_ms: int, timeout: int) -> dict:
+    """Sum OKX funding-fee bills (type=8, amount in `pnl`, negative = paid) per
+    instId. Queries both the 7-day and archive endpoints and dedups by billId."""
+    limit = 100
+    all_rows = []
+    for path in ("/api/v5/account/bills", "/api/v5/account/bills-archive"):
+        after = None
+        guard = 0
+        while guard < 1000:
+            guard += 1
+            params = {"instType": "SWAP", "type": "8", "limit": str(limit)}
+            if start_ms is not None:
+                params["begin"] = str(start_ms)
+            if end_ms is not None:
+                params["end"] = str(end_ms)
+            if after is not None:
+                params["after"] = str(after)
+            try:
+                data = _okx_signed_get(path, params, timeout_s=timeout)
+            except RuntimeError as exc:
+                print(f"  [OKX bills warning] {path}: {exc}")
+                break
+            rows = data.get("data", []) or []
+            if not rows:
+                break
+            all_rows.extend(rows)
+            try:
+                after = min(int(r["billId"]) for r in rows if r.get("billId"))
+            except (ValueError, KeyError):
+                break
+            if len(rows) < limit:
+                break
+
+    seen = set()
+    totals: dict = {}
+    for r in all_rows:
+        bid = r.get("billId")
+        if bid in seen:
+            continue
+        seen.add(bid)
+        inst = r.get("instId")
+        totals[inst] = totals.get(inst, 0.0) + float(r.get("pnl") or 0)
+    return totals
+
+
 def _hl_post(session, payload: dict, timeout: int, retries: int, backoff_s: float) -> Union[list, dict]:
     for attempt in range(retries):
         try:
@@ -180,6 +310,14 @@ def _get_hl_dex_positions(session, dex: str, timeout: int, retries: int, backoff
             continue
         positions.append(pos)
 
+    try:
+        funding_by_coin = _hl_funding_by_coin(
+            session, dex, FUNDING_START_MS, _now_ms(), timeout, retries, backoff_s
+        )
+    except Exception as exc:
+        print(f"  [Hyperliquid funding warning] dex={dex or '(main)'}: {exc}")
+        funding_by_coin = None
+
     long_delta = short_delta = 0.0
     position_rows = []
     isolated_removables = []
@@ -216,6 +354,7 @@ def _get_hl_dex_positions(session, dex: str, timeout: int, retries: int, backoff
             "size": abs(szi), "notional": signed_notional, "mark": mark_px,
             "liq": liq_px, "dist_pct": dist_pct, "margin_mode": margin_mode,
             "isolated_removable": iso_rem,
+            "funding_collected": funding_by_coin.get(coin, 0.0) if funding_by_coin is not None else None,
         })
 
     net_delta = long_delta + short_delta
@@ -251,6 +390,9 @@ def _get_hl_dex_positions(session, dex: str, timeout: int, retries: int, backoff
         "net_delta": net_delta, "gross_notional": gross_notional, "leverage": hl_leverage,
         "account_equity": account_equity, "withdrawable": withdrawable,
         "excess_collateral": excess, "removable_total": removable_total, "mgn_ratio": None,
+        "funding_collected": sum(
+            r["funding_collected"] for r in position_rows if r.get("funding_collected") is not None
+        ),
     }
 
 
@@ -292,6 +434,12 @@ def get_binance_positions():
     all_positions = _signed_get("/fapi/v2/positionRisk")
     positions = [p for p in all_positions if float(p.get("positionAmt", "0")) != 0]
 
+    try:
+        funding_by_symbol = _binance_funding_by_symbol(FUNDING_START_MS, _now_ms())
+    except Exception as exc:
+        print(f"  [Binance funding warning] {exc}")
+        funding_by_symbol = None
+
     long_delta = short_delta = 0.0
     position_rows = []
     isolated_removables = []
@@ -327,6 +475,7 @@ def get_binance_positions():
             "size": abs(amt), "notional": notional, "mark": mark, "liq": liq_out,
             "dist_pct": dist_pct, "margin_mode": margin_type or "unknown",
             "isolated_removable": iso_rem,
+            "funding_collected": funding_by_symbol.get(symbol, 0.0) if funding_by_symbol is not None else None,
         })
 
     net_delta = long_delta + short_delta
@@ -397,6 +546,9 @@ def get_binance_positions():
         "account_equity": account_equity, "withdrawable": withdrawable,
         "excess_collateral": excess, "removable_total": removable_total,
         "mgn_ratio": bn_mgn_ratio if bn_mgn_ratio != float("inf") else None,
+        "funding_collected": sum(
+            r["funding_collected"] for r in position_rows if r.get("funding_collected") is not None
+        ),
     }
 
 
@@ -497,10 +649,19 @@ def get_bybit_positions():
         elif (not is_isolated) and liq_px and mark != 0:
             cross_position_inputs.append({"name": symbol, "size": signed_size, "mark": mark, "liq": liq_px})
 
+        # NOTE: Bybit position objects expose curRealisedPnl (cumulative realized
+        # PnL for the current position: funding + closed PnL + fees), not isolated
+        # funding. Unlike the other venues this is a proxy, not pure funding.
+        try:
+            cur_rpnl = float(p.get("curRealisedPnl") or 0)
+        except (TypeError, ValueError):
+            cur_rpnl = None
+
         position_rows.append({
             "exchange": "Bybit", "symbol": symbol, "direction": direction,
             "size": size, "notional": signed_notional, "mark": mark, "liq": liq_px,
             "dist_pct": dist_pct, "margin_mode": margin_mode, "isolated_removable": iso_rem,
+            "funding_collected": cur_rpnl,
         })
 
     net_delta = long_delta + short_delta
@@ -536,6 +697,9 @@ def get_bybit_positions():
         "net_delta": net_delta, "gross_notional": gross_notional, "leverage": bb_leverage,
         "account_equity": account_equity, "withdrawable": withdrawable,
         "excess_collateral": excess, "removable_total": removable_total, "mgn_ratio": None,
+        "funding_collected": sum(
+            r["funding_collected"] for r in position_rows if r.get("funding_collected") is not None
+        ),
     }
 
 
@@ -575,6 +739,12 @@ def get_okx_positions():
     pos_resp = _okx_signed_get("/api/v5/account/positions", params={}, timeout_s=timeout)
     raw_positions = pos_resp.get("data", []) or []
     positions = [p for p in raw_positions if float(p.get("pos", "0") or 0) != 0]
+
+    try:
+        funding_by_inst = _okx_funding_by_inst(FUNDING_START_MS, _now_ms(), timeout)
+    except Exception as exc:
+        print(f"  [OKX funding warning] {exc}")
+        funding_by_inst = None
 
     long_delta = short_delta = 0.0
     position_rows = []
@@ -621,6 +791,7 @@ def get_okx_positions():
             "size": abs(pos_qty), "notional": signed_notional, "mark": mark,
             "liq": liq_px, "dist_pct": dist_pct, "margin_mode": mgn_mode or "unknown",
             "isolated_removable": iso_rem,
+            "funding_collected": funding_by_inst.get(inst_id, 0.0) if funding_by_inst is not None else None,
         })
 
     net_delta = long_delta + short_delta
@@ -667,6 +838,9 @@ def get_okx_positions():
         "net_delta": net_delta, "gross_notional": gross_notional, "leverage": okx_leverage,
         "account_equity": total_eq, "withdrawable": avail_eq,
         "excess_collateral": excess, "removable_total": removable_total, "mgn_ratio": mgn_ratio,
+        "funding_collected": sum(
+            r["funding_collected"] for r in position_rows if r.get("funding_collected") is not None
+        ),
     }
 
 
@@ -707,6 +881,7 @@ def write_to_sheet(results: list) -> None:
         "Removable", "Currency", "Leverage",
         "Gross Notional", "Net Delta",
         "Account Equity", "Withdrawable / adjEq", "Account mgnRatio",
+        "Funding Collected",
     ])
     for r in results:
         rows.append([
@@ -717,6 +892,7 @@ def write_to_sheet(results: list) -> None:
             _fmt_num(r["net_delta"]), _fmt_num(r["account_equity"]),
             _fmt_num(r["withdrawable"]),
             _fmt_num(r["mgn_ratio"], 4) if r["mgn_ratio"] is not None else "",
+            _fmt_num(r.get("funding_collected")) if r.get("funding_collected") is not None else "",
         ])
 
     rows.append([])
@@ -725,6 +901,7 @@ def write_to_sheet(results: list) -> None:
         "Exchange", "Symbol", "Direction",
         "Size", "Notional (signed)", "Mark", "Liq Price",
         "Dist to Liq %", "Margin Mode", "Isolated Removable",
+        "Funding Collected",
     ])
     all_positions = []
     for r in results:
@@ -743,6 +920,7 @@ def write_to_sheet(results: list) -> None:
             _fmt_num(p["dist_pct"], 2) if p["dist_pct"] is not None else "",
             p["margin_mode"] + (" (see mgnRatio)" if p["dist_pct"] is None and p["margin_mode"] == "cross" else ""),
             _fmt_num(p["isolated_removable"]) if p["isolated_removable"] is not None else "",
+            _fmt_num(p.get("funding_collected")) if p.get("funding_collected") is not None else "",
         ])
 
     rows.append([])
@@ -753,6 +931,9 @@ def write_to_sheet(results: list) -> None:
     rows.append(["OKX mgnRatio target", f"{OKX_MGN_RATIO_TARGET:.2f}x"])
     rows.append(["Binance mgnRatio floor", f"{BN_MGN_RATIO_FLOOR:.2f}x  (for cross positions without per-position liq prices)"])
     rows.append(["Binance mgnRatio target", f"{BN_MGN_RATIO_TARGET:.2f}x"])
+    _fund_since = datetime.fromtimestamp(FUNDING_START_MS / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    rows.append(["Funding window", f"collected since {_fund_since}"])
+    rows.append(["Funding note", "Bybit value is curRealisedPnl (funding+closed PnL+fees), not pure funding"])
 
     max_cols = max(len(row) for row in rows) if rows else 1
     rows = [row + [""] * (max_cols - len(row)) for row in rows]
