@@ -390,9 +390,6 @@ def _get_hl_dex_positions(session, dex: str, timeout: int, retries: int, backoff
         "net_delta": net_delta, "gross_notional": gross_notional, "leverage": hl_leverage,
         "account_equity": account_equity, "withdrawable": withdrawable,
         "excess_collateral": excess, "removable_total": removable_total, "mgn_ratio": None,
-        "funding_collected": sum(
-            r["funding_collected"] for r in position_rows if r.get("funding_collected") is not None
-        ),
     }
 
 
@@ -546,9 +543,6 @@ def get_binance_positions():
         "account_equity": account_equity, "withdrawable": withdrawable,
         "excess_collateral": excess, "removable_total": removable_total,
         "mgn_ratio": bn_mgn_ratio if bn_mgn_ratio != float("inf") else None,
-        "funding_collected": sum(
-            r["funding_collected"] for r in position_rows if r.get("funding_collected") is not None
-        ),
     }
 
 
@@ -697,9 +691,6 @@ def get_bybit_positions():
         "net_delta": net_delta, "gross_notional": gross_notional, "leverage": bb_leverage,
         "account_equity": account_equity, "withdrawable": withdrawable,
         "excess_collateral": excess, "removable_total": removable_total, "mgn_ratio": None,
-        "funding_collected": sum(
-            r["funding_collected"] for r in position_rows if r.get("funding_collected") is not None
-        ),
     }
 
 
@@ -838,9 +829,6 @@ def get_okx_positions():
         "net_delta": net_delta, "gross_notional": gross_notional, "leverage": okx_leverage,
         "account_equity": total_eq, "withdrawable": avail_eq,
         "excess_collateral": excess, "removable_total": removable_total, "mgn_ratio": mgn_ratio,
-        "funding_collected": sum(
-            r["funding_collected"] for r in position_rows if r.get("funding_collected") is not None
-        ),
     }
 
 
@@ -863,6 +851,22 @@ def _fmt_num(v, decimals=2):
         return v
 
 
+def _strategy_key(symbol: str) -> str:
+    """Normalize a venue symbol to its base asset so legs of the same funding-arb
+    strategy group together. Examples:
+      VVVUSDT -> VVV, XMRUSDT -> XMR, VVV -> VVV,
+      xyz:xyz:CL -> CL, CL-USDT-SWAP -> CL."""
+    s = symbol or ""
+    if ":" in s:           # HL builder/dex prefixes: keep the trailing coin
+        s = s.split(":")[-1]
+    if "-" in s:           # OKX BASE-QUOTE-SWAP
+        s = s.split("-")[0]
+    for q in ("USDT", "USDC", "USD"):   # Binance BASEUSDT style
+        if s.endswith(q) and len(s) > len(q):
+            return s[: -len(q)]
+    return s
+
+
 def write_to_sheet(results: list) -> None:
     creds = Credentials.from_service_account_file(GOOGLE_CREDS_FILE, scopes=GSHEET_SCOPES)
     gc = gspread.authorize(creds)
@@ -881,7 +885,6 @@ def write_to_sheet(results: list) -> None:
         "Removable", "Currency", "Leverage",
         "Gross Notional", "Net Delta",
         "Account Equity", "Withdrawable / adjEq", "Account mgnRatio",
-        "Funding Collected",
     ])
     for r in results:
         rows.append([
@@ -892,7 +895,6 @@ def write_to_sheet(results: list) -> None:
             _fmt_num(r["net_delta"]), _fmt_num(r["account_equity"]),
             _fmt_num(r["withdrawable"]),
             _fmt_num(r["mgn_ratio"], 4) if r["mgn_ratio"] is not None else "",
-            _fmt_num(r.get("funding_collected")) if r.get("funding_collected") is not None else "",
         ])
 
     rows.append([])
@@ -923,6 +925,49 @@ def write_to_sheet(results: list) -> None:
             _fmt_num(p.get("funding_collected")) if p.get("funding_collected") is not None else "",
         ])
 
+    # ---- Strategy PnL: group legs by base asset, sum funding, normalize ----
+    rows.append([])
+    rows.append(["Strategy PnL (funding arb)"])
+    rows.append([
+        "Strategy", "Legs (venue:dir)", "Total Funding",
+        "Avg Leg Size", "Funding / Size", "Funding / Notional (bps)",
+    ])
+
+    strat: dict = {}
+    for p in all_positions:
+        key = _strategy_key(p["symbol"])
+        g = strat.setdefault(key, {"legs": [], "funding": 0.0, "has_funding": False,
+                                   "abs_sizes": [], "abs_notionals": []})
+        g["legs"].append(f"{p['exchange']}:{p['direction'][:1]}")
+        fc = p.get("funding_collected")
+        if fc is not None:
+            g["funding"] += fc
+            g["has_funding"] = True
+        try:
+            g["abs_sizes"].append(abs(float(p["size"])))
+        except (TypeError, ValueError):
+            pass
+        try:
+            g["abs_notionals"].append(abs(float(p["notional"])))
+        except (TypeError, ValueError):
+            pass
+
+    for key in sorted(strat):
+        g = strat[key]
+        # "position size" of a delta-neutral pair = the matched per-leg size,
+        # estimated by the average of the absolute leg sizes.
+        avg_size = sum(g["abs_sizes"]) / len(g["abs_sizes"]) if g["abs_sizes"] else 0.0
+        avg_notional = sum(g["abs_notionals"]) / len(g["abs_notionals"]) if g["abs_notionals"] else 0.0
+        f_per_size = g["funding"] / avg_size if avg_size > 0 else None
+        f_per_notional_bps = (g["funding"] / avg_notional * 10000) if avg_notional > 0 else None
+        rows.append([
+            key, ", ".join(g["legs"]),
+            _fmt_num(g["funding"]) if g["has_funding"] else "",
+            _fmt_num(avg_size, 6),
+            _fmt_num(f_per_size, 8) if (f_per_size is not None and g["has_funding"]) else "",
+            _fmt_num(f_per_notional_bps, 2) if (f_per_notional_bps is not None and g["has_funding"]) else "",
+        ])
+
     rows.append([])
     rows.append(["Thresholds"])
     rows.append(["Liq distance threshold", f">{LIQ_DISTANCE_THRESHOLD_PCT:.0f}%"])
@@ -934,6 +979,7 @@ def write_to_sheet(results: list) -> None:
     _fund_since = datetime.fromtimestamp(FUNDING_START_MS / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     rows.append(["Funding window", f"collected since {_fund_since}"])
     rows.append(["Funding note", "Bybit value is curRealisedPnl (funding+closed PnL+fees), not pure funding"])
+    rows.append(["Strategy note", "Funding/Size uses avg abs leg size; valid only when legs share contract units. Use Funding/Notional (bps) for cross-venue strategies (e.g. CL)."])
 
     max_cols = max(len(row) for row in rows) if rows else 1
     rows = [row + [""] * (max_cols - len(row)) for row in rows]
