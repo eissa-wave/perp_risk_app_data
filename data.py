@@ -11,6 +11,7 @@ Jenkins setup:
 
   Optional environment variables:
     HL_USER          -- Hyperliquid wallet to monitor
+    HL_DEXS          -- comma-separated dexs; "" is main, add HIP-3 builders (default ",xyz")
     SHEET_NAME       -- default "Portfolios"
     TAB_RISK         -- default "perp_monitor"
 
@@ -56,6 +57,10 @@ OKX_PASSPHRASE = _required_env("OKX_PASS")
 GOOGLE_CREDS_FILE = _required_env("GOOGLE_APPLICATION_CREDENTIALS")
 
 HL_USER = os.environ.get("HL_USER", "0x64Ffaa34FffC59e84D3E7731812b3A63397Af7c6")
+# DEXs to query. "" is the main validator-operated perp dex. Add HIP-3 builder
+# dex names (e.g. "xyz" for xyz:CL). Each dex margins independently, so it is
+# fetched separately and reported as its own account row "Hyperliquid:<dex>".
+HL_DEXS = [d.strip() for d in os.environ.get("HL_DEXS", ",xyz").split(",")]
 SHEET_NAME = os.environ.get("SHEET_NAME", "Portfolios")
 TAB_RISK = os.environ.get("TAB_RISK", "perp_monitor")
 
@@ -84,6 +89,18 @@ GSHEET_SCOPES = [
 def _log(msg: str) -> None:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"[{ts}] {msg}", flush=True)
+
+
+def _summary_line(r: dict) -> str:
+    s = (
+        f"{r['exchange']}: {r['positions_count']} positions, "
+        f"excess={r['excess_collateral']}, "
+        f"removable={r['removable_total']:,.2f} {r['currency']}, "
+        f"leverage={r['leverage']:.2f}x"
+    )
+    if r['mgn_ratio'] is not None:
+        s += f", mgnRatio={r['mgn_ratio']:.2f}x"
+    return s
 
 
 def _removable_isolated_position(direction: str, size: float, mark: float, liq: float) -> float:
@@ -122,24 +139,36 @@ def _removable_cross_binding(cross_positions: list, account_equity: float) -> fl
     return max(0.0, min(min(per_pos_caps), account_equity))
 
 
-def get_hl_positions():
-    timeout, retries, backoff_s = 20, 5, 0.4
-    session = requests.Session()
-    session.headers.update({"Content-Type": "application/json"})
+def _hl_post(session, payload: dict, timeout: int, retries: int, backoff_s: float) -> Union[list, dict]:
+    for attempt in range(retries):
+        try:
+            resp = session.post(HL_INFO_URL, json=payload, timeout=timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except (requests.RequestException, ValueError) as exc:
+            if attempt == retries - 1:
+                raise
+            time.sleep(backoff_s * (2 ** attempt))
 
-    def _post(payload: dict) -> Union[list, dict]:
-        for attempt in range(retries):
-            try:
-                resp = session.post(HL_INFO_URL, json=payload, timeout=timeout)
-                resp.raise_for_status()
-                return resp.json()
-            except (requests.RequestException, ValueError) as exc:
-                if attempt == retries - 1:
-                    raise
-                time.sleep(backoff_s * (2 ** attempt))
 
-    state = _post({"type": "clearinghouseState", "user": HL_USER})
-    meta_resp = _post({"type": "metaAndAssetCtxs"})
+def _get_hl_dex_positions(session, dex: str, timeout: int, retries: int, backoff_s: float) -> dict:
+    """Fetch one HL perp dex. dex="" is the main validator-operated dex; a
+    non-empty name is a HIP-3 builder dex with independent margining. Builder-dex
+    symbols are prefixed dex:coin (e.g. xyz:CL) and the account is reported as
+    its own row "Hyperliquid:<dex>" since equity/withdrawable are dex-scoped."""
+    label = "Hyperliquid" if not dex else f"Hyperliquid:{dex}"
+    prefix = f"{dex}:" if dex else ""
+
+    ch_payload = {"type": "clearinghouseState", "user": HL_USER}
+    if dex:
+        ch_payload["dex"] = dex
+    state = _hl_post(session, ch_payload, timeout, retries, backoff_s)
+
+    meta_payload = {"type": "metaAndAssetCtxs"}
+    if dex:
+        meta_payload["dex"] = dex
+    meta_resp = _hl_post(session, meta_payload, timeout, retries, backoff_s)
+
     universe = meta_resp[0]["universe"]
     ctxs = meta_resp[1]
     mark_prices = {asset["name"]: float(ctx["markPx"]) for asset, ctx in zip(universe, ctxs)}
@@ -183,7 +212,7 @@ def get_hl_positions():
             cross_position_inputs.append({"name": coin, "size": szi, "mark": mark_px, "liq": liq_px})
 
         position_rows.append({
-            "exchange": "Hyperliquid", "symbol": coin, "direction": direction,
+            "exchange": label, "symbol": f"{prefix}{coin}", "direction": direction,
             "size": abs(szi), "notional": signed_notional, "mark": mark_px,
             "liq": liq_px, "dist_pct": dist_pct, "margin_mode": margin_mode,
             "isolated_removable": iso_rem,
@@ -217,12 +246,32 @@ def get_hl_positions():
     removable_total = max(0.0, min(pos_constrained, withdrawable))
 
     return {
-        "exchange": "Hyperliquid", "currency": "USDC", "positions_count": len(positions),
+        "exchange": label, "currency": "USDC", "positions_count": len(positions),
         "position_rows": position_rows, "long_delta": long_delta, "short_delta": short_delta,
         "net_delta": net_delta, "gross_notional": gross_notional, "leverage": hl_leverage,
         "account_equity": account_equity, "withdrawable": withdrawable,
         "excess_collateral": excess, "removable_total": removable_total, "mgn_ratio": None,
     }
+
+
+def get_hl_positions():
+    """Return a list of per-dex result dicts (main + any configured HIP-3 builders).
+    Each dex margins independently, so each is reported as its own account row.
+    Builder dexs with no open positions are skipped; the main dex is always kept."""
+    timeout, retries, backoff_s = 20, 5, 0.4
+    session = requests.Session()
+    session.headers.update({"Content-Type": "application/json"})
+
+    out = []
+    for dex in HL_DEXS:
+        try:
+            r = _get_hl_dex_positions(session, dex, timeout, retries, backoff_s)
+        except Exception as exc:
+            _log(f"  [Hyperliquid dex={dex or '(main)'} ERROR] {type(exc).__name__}: {exc}")
+            continue
+        if dex == "" or r["positions_count"] > 0:
+            out.append(r)
+    return out
 
 
 def get_binance_positions():
@@ -726,14 +775,12 @@ def main() -> int:
         _log(f"Fetching {name}...")
         try:
             r = fn()
-            results.append(r)
-            _log(
-                f"  {name}: {r['positions_count']} positions, "
-                f"excess={r['excess_collateral']}, "
-                f"removable={r['removable_total']:,.2f} {r['currency']}, "
-                f"leverage={r['leverage']:.2f}x"
-                + (f", mgnRatio={r['mgn_ratio']:.2f}x" if r['mgn_ratio'] is not None else "")
-            )
+            batch = r if isinstance(r, list) else [r]
+            if not batch:
+                _log(f"  {name}: no account rows returned.")
+            for item in batch:
+                results.append(item)
+                _log("  " + _summary_line(item))
         except Exception as exc:
             failures.append((name, exc))
             _log(f"  [{name} ERROR] {type(exc).__name__}: {exc}")
