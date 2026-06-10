@@ -88,6 +88,21 @@ FUNDING_START_MS = int(
     os.environ.get("FUNDING_START_MS", str(int((time.time() - 90 * 86400) * 1000)))
 )
 
+# ============================================================
+#  STRATEGY START DATES (hardcoded, by base ticker)
+# ============================================================
+# Trade entry date per funding-arb strategy, keyed by the normalized base
+# ticker (the same key the Strategy PnL section groups on, e.g. "VVV", "XMR",
+# "CL"). Used to annualize collected funding: ann% = (funding / avg notional)
+# * (365 / days since start) * 100. Strategies missing from this map show a
+# blank annualized column. Update when entering/rolling a new strategy.
+STRATEGY_START_DATES = {
+    # "TICKER": "YYYY-MM-DD",
+    "XMR": "2026-05-04",
+    "VVV": "2026-05-20",
+    "CL": "2026-06-08",
+}
+
 GSHEET_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -930,7 +945,7 @@ def write_to_sheet(results: list) -> None:
     rows.append(["Strategy PnL (funding arb)"])
     rows.append([
         "Strategy", "Legs (venue:dir)", "Total Funding",
-        "Avg Leg Size", "Funding / Notional (%)",
+        "Avg Leg Size", "Funding / Notional (%)", "Start Date", "Funding Annualized (%)",
     ])
 
     strat: dict = {}
@@ -959,11 +974,26 @@ def write_to_sheet(results: list) -> None:
         avg_size = sum(g["abs_sizes"]) / len(g["abs_sizes"]) if g["abs_sizes"] else 0.0
         avg_notional = sum(g["abs_notionals"]) / len(g["abs_notionals"]) if g["abs_notionals"] else 0.0
         f_per_notional_pct = (g["funding"] / avg_notional * 100) if avg_notional > 0 else None
+
+        # Annualize using the hardcoded strategy start date.
+        start_str = STRATEGY_START_DATES.get(key)
+        ann_pct = None
+        if start_str and f_per_notional_pct is not None:
+            try:
+                start_dt = datetime.strptime(start_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                days = (datetime.now(timezone.utc) - start_dt).total_seconds() / 86400.0
+                if days > 0:
+                    ann_pct = f_per_notional_pct * (365.0 / days)
+            except ValueError:
+                pass
+
         rows.append([
             key, ", ".join(g["legs"]),
             _fmt_num(g["funding"]) if g["has_funding"] else "",
             _fmt_num(avg_size, 6),
             _fmt_num(f_per_notional_pct, 4) if (f_per_notional_pct is not None and g["has_funding"]) else "",
+            start_str or "",
+            _fmt_num(ann_pct, 2) if (ann_pct is not None and g["has_funding"]) else "",
         ])
 
     rows.append([])
@@ -977,7 +1007,7 @@ def write_to_sheet(results: list) -> None:
     _fund_since = datetime.fromtimestamp(FUNDING_START_MS / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     rows.append(["Funding window", f"collected since {_fund_since}"])
     rows.append(["Funding note", "Bybit value is curRealisedPnl (funding+closed PnL+fees), not pure funding"])
-    rows.append(["Strategy note", "Funding/Notional (%) = total funding / avg abs leg notional; unit-consistent across venues."])
+    rows.append(["Strategy note", "Funding/Notional (%) = total funding / avg abs leg notional. Annualized = that % * 365/days since hardcoded start date (STRATEGY_START_DATES). Funding window must cover the start date or the annualized figure understates."])
 
     max_cols = max(len(row) for row in rows) if rows else 1
     rows = [row + [""] * (max_cols - len(row)) for row in rows]
