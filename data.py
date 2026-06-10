@@ -637,6 +637,7 @@ def get_okx_positions():
 
     total_eq = _f(acct.get("totalEq"))
     adj_eq = _f(acct.get("adjEq"))
+    avail_eq = _f(acct.get("availEq"))
     mmr = _f(acct.get("mmr"))
     mgn_ratio = _f(acct.get("mgnRatio"))
     okx_leverage = gross_notional / total_eq if total_eq > 0 else 0.0
@@ -654,14 +655,17 @@ def get_okx_positions():
         cross_removable = max(0.0, adj_eq - mmr * OKX_MGN_RATIO_TARGET)
     else:
         cross_removable = 0.0
-    wd_cap = adj_eq if adj_eq > 0 else float("inf")
+    # availEq is the free/withdrawable portion; adjEq is total adjusted equity.
+    # cross_removable above is correctly equity-based, but the final cap must be
+    # what is actually free to pull.
+    wd_cap = avail_eq if avail_eq > 0 else float("inf")
     removable_total = max(0.0, min(iso_sum + cross_removable, wd_cap))
 
     return {
         "exchange": "OKX", "currency": "USD", "positions_count": len(positions),
         "position_rows": position_rows, "long_delta": long_delta, "short_delta": short_delta,
         "net_delta": net_delta, "gross_notional": gross_notional, "leverage": okx_leverage,
-        "account_equity": total_eq, "withdrawable": adj_eq,
+        "account_equity": total_eq, "withdrawable": avail_eq,
         "excess_collateral": excess, "removable_total": removable_total, "mgn_ratio": mgn_ratio,
     }
 
