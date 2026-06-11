@@ -108,6 +108,7 @@ STRATEGY_START_DATES = {
     "VVV": "2026-06-10",
     "CL": "2026-06-10",
     "ADA": "2026-06-11",
+    "MU": "2026-06-11",
 }
 
 GSHEET_SCOPES = [
