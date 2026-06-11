@@ -61,6 +61,12 @@ HL_USER = os.environ.get("HL_USER", "0x64Ffaa34FffC59e84D3E7731812b3A63397Af7c6"
 # dex names (e.g. "xyz" for xyz:CL). Each dex margins independently, so it is
 # fetched separately and reported as its own account row "Hyperliquid:<dex>".
 HL_DEXS = [d.strip() for d in os.environ.get("HL_DEXS", ",xyz").split(",")]
+# The account runs HL's unified account mode: one USDC balance collateralizes
+# spot plus all cross-margin perps across every dex. When True, HL is reported
+# as a single account row using the unified balance as equity, and removable is
+# computed against the unified balance. Set False (or env HL_UNIFIED=0) if the
+# account is switched back to standard mode with separate per-dex balances.
+HL_UNIFIED = os.environ.get("HL_UNIFIED", "1") not in ("0", "false", "False")
 SHEET_NAME = os.environ.get("SHEET_NAME", "Portfolios")
 TAB_RISK = os.environ.get("TAB_RISK", "perp_monitor")
 
@@ -101,6 +107,7 @@ STRATEGY_START_DATES = {
     "XMR": "2026-06-08",
     "VVV": "2026-06-10",
     "CL": "2026-06-10",
+    "ADA": "2026-06-10",
 }
 
 GSHEET_SCOPES = [
@@ -405,18 +412,96 @@ def _get_hl_dex_positions(session, dex: str, timeout: int, retries: int, backoff
         "net_delta": net_delta, "gross_notional": gross_notional, "leverage": hl_leverage,
         "account_equity": account_equity, "withdrawable": withdrawable,
         "excess_collateral": excess, "removable_total": removable_total, "mgn_ratio": None,
+        # raw components for the unified-mode combiner (stripped before sheet write)
+        "_iso_removables": isolated_removables,
+        "_cross_inputs": cross_position_inputs,
+        "_upl": sum(
+            float((ap.get("position") or {}).get("unrealizedPnl") or 0)
+            for ap in state.get("assetPositions", []) or []
+        ),
+    }
+
+
+def _get_hl_unified(session, per_dex: list, timeout: int, retries: int, backoff_s: float) -> dict:
+    """Combine per-dex results into one unified-account row. In unified mode a
+    single USDC balance backs spot plus all cross perps on every dex, so equity,
+    leverage, withdrawable, and removable are computed against the unified
+    balance, not the per-dex margin allocations. Isolated positions (e.g.
+    xyz:CL) keep their own ring-fenced margin and are unaffected by the mode."""
+    spot = _hl_post(session, {"type": "spotClearinghouseState", "user": HL_USER},
+                    timeout, retries, backoff_s)
+    usdc_total = 0.0
+    usdc_hold = 0.0
+    for b in spot.get("balances", []) or []:
+        if b.get("coin") == "USDC":
+            try:
+                usdc_total += float(b.get("total") or 0)
+                usdc_hold += float(b.get("hold") or 0)
+            except (TypeError, ValueError):
+                pass
+
+    position_rows = []
+    isolated_removables = []
+    cross_inputs = []
+    long_delta = short_delta = 0.0
+    total_upl = 0.0
+    for r in per_dex:
+        for row in r["position_rows"]:
+            row = dict(row)
+            row["exchange"] = "Hyperliquid"   # one account row in unified mode
+            position_rows.append(row)
+        isolated_removables += r.get("_iso_removables", [])
+        cross_inputs += r.get("_cross_inputs", [])
+        long_delta += r["long_delta"]
+        short_delta += r["short_delta"]
+        total_upl += r.get("_upl", 0.0)
+
+    net_delta = long_delta + short_delta
+    gross_notional = long_delta + abs(short_delta)
+
+    # Unified equity = unified USDC balance + mark-to-market on open perps.
+    # (The spot USDC total is the settled unified balance; uPnL sits on top.)
+    account_equity = usdc_total + total_upl
+    # Exchange-level pullable cash: unified balance not held by spot orders and
+    # not allocated as margin. The UI "Available Balance" analog.
+    withdrawable = max(0.0, usdc_total - usdc_hold)
+    hl_leverage = gross_notional / account_equity if account_equity > 0 else 0.0
+
+    measurable = [r for r in position_rows if r["dist_pct"] is not None]
+    if not position_rows:
+        excess = True
+    elif not measurable:
+        excess = False
+    else:
+        excess = min(r["dist_pct"] for r in measurable) > LIQ_DISTANCE_THRESHOLD_PCT
+
+    # Removable: how much can be pulled from the unified account while keeping
+    # every cross position at >= TARGET_LIQ_DISTANCE_PCT, evaluated against the
+    # unified equity (all cross positions on all dexs share it). Isolated
+    # release amounts are additive since freeing isolated margin returns it to
+    # the unified balance.
+    iso_sum = sum(max(amt, 0.0) for _, amt in isolated_removables)
+    cross_cap = _removable_cross_binding(cross_inputs, account_equity)
+    removable_total = max(0.0, min(iso_sum + cross_cap, withdrawable + iso_sum))
+
+    return {
+        "exchange": "Hyperliquid", "currency": "USDC", "positions_count": len(position_rows),
+        "position_rows": position_rows, "long_delta": long_delta, "short_delta": short_delta,
+        "net_delta": net_delta, "gross_notional": gross_notional, "leverage": hl_leverage,
+        "account_equity": account_equity, "withdrawable": withdrawable,
+        "excess_collateral": excess, "removable_total": removable_total, "mgn_ratio": None,
     }
 
 
 def get_hl_positions():
-    """Return a list of per-dex result dicts (main + any configured HIP-3 builders).
-    Each dex margins independently, so each is reported as its own account row.
-    Builder dexs with no open positions are skipped; the main dex is always kept."""
+    """Standard mode: one result dict per dex (independent margining).
+    Unified mode (HL_UNIFIED): one combined dict computed against the unified
+    USDC balance."""
     timeout, retries, backoff_s = 20, 5, 0.4
     session = requests.Session()
     session.headers.update({"Content-Type": "application/json"})
 
-    out = []
+    per_dex = []
     for dex in HL_DEXS:
         try:
             r = _get_hl_dex_positions(session, dex, timeout, retries, backoff_s)
@@ -424,8 +509,20 @@ def get_hl_positions():
             _log(f"  [Hyperliquid dex={dex or '(main)'} ERROR] {type(exc).__name__}: {exc}")
             continue
         if dex == "" or r["positions_count"] > 0:
-            out.append(r)
-    return out
+            per_dex.append(r)
+
+    if HL_UNIFIED:
+        try:
+            return [_get_hl_unified(session, per_dex, timeout, retries, backoff_s)]
+        except Exception as exc:
+            _log(f"  [Hyperliquid unified ERROR] {type(exc).__name__}: {exc}; "
+                 "falling back to per-dex rows")
+
+    # strip private fields before returning per-dex rows
+    for r in per_dex:
+        for k in ("_iso_removables", "_cross_inputs", "_upl"):
+            r.pop(k, None)
+    return per_dex
 
 
 def get_binance_positions():
