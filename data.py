@@ -111,6 +111,12 @@ STRATEGY_START_DATES = {
     "MU": "2026-06-11",
 }
 
+# Hide dust: position rows with absolute notional below this are excluded from
+# the sheet (Per-Position Detail and Strategy PnL legs). They still count in
+# the fetchers' risk math (equity, deltas, removable). Env override
+# MIN_POSITION_USD; set 0 to show everything.
+MIN_POSITION_USD = float(os.environ.get("MIN_POSITION_USD", "100"))
+
 GSHEET_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -1019,8 +1025,17 @@ def write_to_sheet(results: list) -> None:
         "Funding Collected",
     ])
     all_positions = []
+    hidden_count = 0
     for r in results:
-        all_positions.extend(r["position_rows"])
+        for p in r["position_rows"]:
+            try:
+                small = abs(float(p["notional"])) < MIN_POSITION_USD
+            except (TypeError, ValueError):
+                small = False
+            if small:
+                hidden_count += 1
+                continue
+            all_positions.append(p)
 
     def _sort_key(p):
         dist = p["dist_pct"]
@@ -1104,6 +1119,8 @@ def write_to_sheet(results: list) -> None:
     rows.append(["Binance mgnRatio target", f"{BN_MGN_RATIO_TARGET:.2f}x"])
     _fund_since = datetime.fromtimestamp(FUNDING_START_MS / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     rows.append(["Funding window", f"collected since {_fund_since}"])
+    if MIN_POSITION_USD > 0:
+        rows.append(["Small balance filter", f"positions under ${MIN_POSITION_USD:,.0f} notional hidden ({hidden_count} hidden this run); still included in risk math"])
     rows.append(["Strategy note", "Funding/Notional (%) = total funding / avg abs leg notional. Annualized = that % * 365/days since hardcoded start date (STRATEGY_START_DATES). Funding window must cover the start date or the annualized figure understates."])
 
     max_cols = max(len(row) for row in rows) if rows else 1
