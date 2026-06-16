@@ -104,11 +104,10 @@ FUNDING_START_MS = int(
 # blank annualized column. Update when entering/rolling a new strategy.
 STRATEGY_START_DATES = {
     # "TICKER": "YYYY-MM-DD",
-    "XMR": "2026-06-08",
     "VVV": "2026-06-10",
     "CL": "2026-06-10",
-    "ADA": "2026-06-11",
     "MU": "2026-06-11",
+    "TRUMP: "2026-06-16",
 }
 
 # Hide dust: position rows with absolute notional below this are excluded from
