@@ -107,7 +107,7 @@ STRATEGY_START_DATES = {
     "VVV": "2026-06-10",
     "CL": "2026-06-10",
     "MU": "2026-06-11",
-    "TRUMP: "2026-06-16",
+    "TRUMP": "2026-06-16",
 }
 
 # Hide dust: position rows with absolute notional below this are excluded from
