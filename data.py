@@ -115,7 +115,7 @@ STRATEGY_START_DATES = {
 # the sheet (Per-Position Detail and Strategy PnL legs). They still count in
 # the fetchers' risk math (equity, deltas, removable). Env override
 # MIN_POSITION_USD; set 0 to show everything.
-MIN_POSITION_USD = float(os.environ.get("MIN_POSITION_USD", "200"))
+MIN_POSITION_USD = float(os.environ.get("MIN_POSITION_USD", "300"))
 
 GSHEET_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
