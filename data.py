@@ -108,13 +108,14 @@ STRATEGY_START_DATES = {
     "CL": "2026-06-10",
     "MU": "2026-06-11",
     "TRUMP": "2026-06-16",
+
 }
 
 # Hide dust: position rows with absolute notional below this are excluded from
 # the sheet (Per-Position Detail and Strategy PnL legs). They still count in
 # the fetchers' risk math (equity, deltas, removable). Env override
 # MIN_POSITION_USD; set 0 to show everything.
-MIN_POSITION_USD = float(os.environ.get("MIN_POSITION_USD", "100"))
+MIN_POSITION_USD = float(os.environ.get("MIN_POSITION_USD", "200"))
 
 GSHEET_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -1021,7 +1022,7 @@ def write_to_sheet(results: list) -> None:
         "Exchange", "Symbol", "Direction",
         "Size", "Notional (signed)", "Mark", "Liq Price",
         "Dist to Liq %", "Margin Mode", "Isolated Removable",
-        "Funding Collected",
+        "Funding Collected", "Type",
     ])
     all_positions = []
     hidden_count = 0
@@ -1040,7 +1041,17 @@ def write_to_sheet(results: list) -> None:
         dist = p["dist_pct"]
         return (p["exchange"], 0 if dist is not None else 1, dist if dist is not None else 0)
 
+    # A funding-arb strategy has two legs (long one venue, short another). A base
+    # ticker that appears as only a single leg in the (dust-filtered) book is an
+    # unhedged single-sided position, i.e. cash and carry. Tag those rows.
+    legs_per_strategy: dict = {}
+    for p in all_positions:
+        legs_per_strategy.setdefault(_strategy_key(p["symbol"]), 0)
+        legs_per_strategy[_strategy_key(p["symbol"])] += 1
+    single_leg_keys = {k for k, n in legs_per_strategy.items() if n == 1}
+
     for p in sorted(all_positions, key=_sort_key):
+        pos_type = "Cash and carry" if _strategy_key(p["symbol"]) in single_leg_keys else ""
         rows.append([
             p["exchange"], p["symbol"], p["direction"],
             _fmt_num(p["size"], 6), _fmt_num(p["notional"]),
@@ -1050,6 +1061,7 @@ def write_to_sheet(results: list) -> None:
             p["margin_mode"] + (" (see mgnRatio)" if p["dist_pct"] is None and p["margin_mode"] == "cross" else ""),
             _fmt_num(p["isolated_removable"]) if p["isolated_removable"] is not None else "",
             _fmt_num(p.get("funding_collected")) if p.get("funding_collected") is not None else "",
+            pos_type,
         ])
 
     # ---- Strategy PnL: group legs by base asset, sum funding, normalize ----
