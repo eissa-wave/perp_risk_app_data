@@ -103,6 +103,7 @@ STRATEGY_START_DATES = {
     # "TICKER": "YYYY-MM-DD",
     "VVV": "2026-06-10",
     "CL": "2026-06-10",
+    "MU": "2026-06-11",
     "TRUMP": "2026-06-16",
     "NVDA": "2026-07-07",
 
@@ -227,8 +228,13 @@ def _hl_funding_by_coin(session, dex: str, start_ms: int, end_ms: int,
     Pagination re-fetches from the last timestamp inclusive (cur = last_time,
     not last_time + 1) and dedups on (time, coin, usdc) so events sharing the
     boundary timestamp of a full page are never dropped. Per-coin clipping to
-    the strategy start date happens here."""
+    the strategy start date happens here.
+
+    Returns (totals, totals_24h): funding since the clipped window start, and
+    funding over the trailing 24 hours."""
     totals: dict = {}
+    totals_24h: dict = {}
+    cutoff_24h = end_ms - 86_400_000
     seen = set()
     cur = start_ms
     pages = 0
@@ -251,6 +257,8 @@ def _hl_funding_by_coin(session, dex: str, start_ms: int, end_ms: int,
             if key in seen:
                 continue
             seen.add(key)
+            if t is not None and int(t) >= cutoff_24h:
+                totals_24h[coin] = totals_24h.get(coin, 0.0) + float(usdc)
             if t is not None and int(t) < _funding_start_for(coin):
                 continue
             totals[coin] = totals.get(coin, 0.0) + float(usdc)
@@ -266,21 +274,25 @@ def _hl_funding_by_coin(session, dex: str, start_ms: int, end_ms: int,
         cur = next_cur
         if cur > end_ms:
             break
-    return totals
+    return totals, totals_24h
 
 
-def _binance_funding_by_symbol(start_ms: int, end_ms: int) -> dict:
+def _binance_funding_by_symbol(start_ms: int, end_ms: int) -> tuple:
     """Sum Binance FUNDING_FEE income (negative = paid) per symbol across all
     symbols, paginating via the last event time.
 
     Pagination re-fetches from the last timestamp inclusive and dedups on
     tranId (fallback: time/symbol/income tuple) so boundary-timestamp events
     are never dropped. Per-symbol clipping to the strategy start date happens
-    here."""
+    here.
+
+    Returns (totals, totals_24h)."""
     base_url = "https://fapi.binance.com"
     path = "/fapi/v1/income"
     limit = 1000
     totals: dict = {}
+    totals_24h: dict = {}
+    cutoff_24h = end_ms - 86_400_000
     seen = set()
     current_start = start_ms
     while True:
@@ -310,6 +322,8 @@ def _binance_funding_by_symbol(start_ms: int, end_ms: int) -> dict:
             seen.add(key)
             sym = x.get("symbol")
             t = x.get("time")
+            if t is not None and int(t) >= cutoff_24h:
+                totals_24h[sym] = totals_24h.get(sym, 0.0) + float(x.get("income") or 0)
             if t is not None and int(t) < _funding_start_for(sym):
                 continue
             totals[sym] = totals.get(sym, 0.0) + float(x.get("income") or 0)
@@ -322,10 +336,10 @@ def _binance_funding_by_symbol(start_ms: int, end_ms: int) -> dict:
         else:
             current_start = last_time
         time.sleep(0.2)
-    return totals
+    return totals, totals_24h
 
 
-def _okx_funding_by_inst(start_ms: int, end_ms: int, timeout: int) -> dict:
+def _okx_funding_by_inst(start_ms: int, end_ms: int, timeout: int) -> tuple:
     """Sum OKX funding-fee bills (type=8, amount in `pnl`, negative = paid) per
     instId. Queries both the 7-day and archive endpoints and dedups by billId.
     Per-instId clipping to the strategy start date is applied via each bill's ts."""
@@ -361,6 +375,8 @@ def _okx_funding_by_inst(start_ms: int, end_ms: int, timeout: int) -> dict:
 
     seen = set()
     totals: dict = {}
+    totals_24h: dict = {}
+    cutoff_24h = end_ms - 86_400_000
     for r in all_rows:
         bid = r.get("billId")
         if bid in seen:
@@ -371,10 +387,12 @@ def _okx_funding_by_inst(start_ms: int, end_ms: int, timeout: int) -> dict:
             ts = int(r.get("ts") or 0)
         except (TypeError, ValueError):
             ts = 0
+        if ts and ts >= cutoff_24h:
+            totals_24h[inst] = totals_24h.get(inst, 0.0) + float(r.get("pnl") or 0)
         if ts and ts < _funding_start_for(inst):
             continue
         totals[inst] = totals.get(inst, 0.0) + float(r.get("pnl") or 0)
-    return totals
+    return totals, totals_24h
 
 
 def _hl_post(session, payload: dict, timeout: int, retries: int, backoff_s: float) -> Union[list, dict]:
@@ -419,12 +437,13 @@ def _get_hl_dex_positions(session, dex: str, timeout: int, retries: int, backoff
         positions.append(pos)
 
     try:
-        funding_by_coin = _hl_funding_by_coin(
+        funding_by_coin, funding_24h_by_coin = _hl_funding_by_coin(
             session, dex, FUNDING_START_MS, _now_ms(), timeout, retries, backoff_s
         )
     except Exception as exc:
         print(f"  [Hyperliquid funding warning] dex={dex or '(main)'}: {exc}")
         funding_by_coin = None
+        funding_24h_by_coin = None
 
     long_delta = short_delta = 0.0
     position_rows = []
@@ -463,6 +482,7 @@ def _get_hl_dex_positions(session, dex: str, timeout: int, retries: int, backoff
             "liq": liq_px, "dist_pct": dist_pct, "margin_mode": margin_mode,
             "isolated_removable": iso_rem,
             "funding_collected": funding_by_coin.get(coin, 0.0) if funding_by_coin is not None else None,
+            "funding_24h": funding_24h_by_coin.get(coin, 0.0) if funding_24h_by_coin is not None else None,
         })
 
     net_delta = long_delta + short_delta
@@ -630,10 +650,11 @@ def get_binance_positions():
     positions = [p for p in all_positions if float(p.get("positionAmt", "0")) != 0]
 
     try:
-        funding_by_symbol = _binance_funding_by_symbol(FUNDING_START_MS, _now_ms())
+        funding_by_symbol, funding_24h_by_symbol = _binance_funding_by_symbol(FUNDING_START_MS, _now_ms())
     except Exception as exc:
         print(f"  [Binance funding warning] {exc}")
         funding_by_symbol = None
+        funding_24h_by_symbol = None
 
     long_delta = short_delta = 0.0
     position_rows = []
@@ -671,6 +692,7 @@ def get_binance_positions():
             "dist_pct": dist_pct, "margin_mode": margin_type or "unknown",
             "isolated_removable": iso_rem,
             "funding_collected": funding_by_symbol.get(symbol, 0.0) if funding_by_symbol is not None else None,
+            "funding_24h": funding_24h_by_symbol.get(symbol, 0.0) if funding_24h_by_symbol is not None else None,
         })
 
     net_delta = long_delta + short_delta
@@ -854,6 +876,7 @@ def get_bybit_positions():
             "size": size, "notional": signed_notional, "mark": mark, "liq": liq_px,
             "dist_pct": dist_pct, "margin_mode": margin_mode, "isolated_removable": iso_rem,
             "funding_collected": cur_rpnl,
+            "funding_24h": None,  # curRealisedPnl proxy has no 24h breakdown
         })
 
     net_delta = long_delta + short_delta
@@ -930,10 +953,11 @@ def get_okx_positions():
     positions = [p for p in raw_positions if float(p.get("pos", "0") or 0) != 0]
 
     try:
-        funding_by_inst = _okx_funding_by_inst(FUNDING_START_MS, _now_ms(), timeout)
+        funding_by_inst, funding_24h_by_inst = _okx_funding_by_inst(FUNDING_START_MS, _now_ms(), timeout)
     except Exception as exc:
         print(f"  [OKX funding warning] {exc}")
         funding_by_inst = None
+        funding_24h_by_inst = None
 
     long_delta = short_delta = 0.0
     position_rows = []
@@ -981,6 +1005,7 @@ def get_okx_positions():
             "liq": liq_px, "dist_pct": dist_pct, "margin_mode": mgn_mode or "unknown",
             "isolated_removable": iso_rem,
             "funding_collected": funding_by_inst.get(inst_id, 0.0) if funding_by_inst is not None else None,
+            "funding_24h": funding_24h_by_inst.get(inst_id, 0.0) if funding_24h_by_inst is not None else None,
         })
 
     net_delta = long_delta + short_delta
@@ -1147,7 +1172,7 @@ def write_to_sheet(results: list) -> None:
     rows.append([])
     rows.append(["Strategy PnL (funding arb)"])
     rows.append([
-        "Strategy", "Legs (venue:dir)", "Total Funding",
+        "Strategy", "Legs (venue:dir)", "Total Funding", "24 Hr Funding",
         "Avg Leg Size", "Funding / Notional (%)", "Start Date", "Funding Annualized (%)",
     ])
 
@@ -1155,12 +1180,17 @@ def write_to_sheet(results: list) -> None:
     for p in all_positions:
         key = _strategy_key(p["symbol"])
         g = strat.setdefault(key, {"legs": [], "funding": 0.0, "has_funding": False,
+                                   "funding_24h": 0.0, "has_funding_24h": False,
                                    "abs_sizes": [], "abs_notionals": []})
         g["legs"].append(f"{p['exchange']}:{p['direction'][:1]}")
         fc = p.get("funding_collected")
         if fc is not None:
             g["funding"] += fc
             g["has_funding"] = True
+        f24 = p.get("funding_24h")
+        if f24 is not None:
+            g["funding_24h"] += f24
+            g["has_funding_24h"] = True
         try:
             g["abs_sizes"].append(abs(float(p["size"])))
         except (TypeError, ValueError):
@@ -1193,6 +1223,7 @@ def write_to_sheet(results: list) -> None:
         rows.append([
             key, ", ".join(g["legs"]),
             _fmt_num(g["funding"]) if g["has_funding"] else "",
+            _fmt_num(g["funding_24h"]) if g["has_funding_24h"] else "",
             _fmt_num(avg_size, 6),
             _fmt_num(f_per_notional_pct, 4) if (f_per_notional_pct is not None and g["has_funding"]) else "",
             start_str or "",
@@ -1211,7 +1242,7 @@ def write_to_sheet(results: list) -> None:
     rows.append(["Funding window", f"fixed global start {_fund_since}; mapped strategies clipped to their STRATEGY_START_DATES entry"])
     if MIN_POSITION_USD > 0:
         rows.append(["Small balance filter", f"positions under ${MIN_POSITION_USD:,.0f} notional hidden ({hidden_count} hidden this run); still included in risk math"])
-    rows.append(["Strategy note", "Funding/Notional (%) = total funding / avg abs leg notional. Annualized = that % * 365/days since hardcoded start date (STRATEGY_START_DATES). Mapped strategies sum funding only from their start date, so the annualized figure is exact for them."])
+    rows.append(["Strategy note", "Funding/Notional (%) = total funding / avg abs leg notional. Annualized = that % * 365/days since hardcoded start date (STRATEGY_START_DATES). Mapped strategies sum funding only from their start date, so the annualized figure is exact for them. 24 Hr Funding = funding events in the trailing 24h; Bybit legs are excluded (curRealisedPnl has no time breakdown), so strategies with a Bybit leg understate."])
 
     max_cols = max(len(row) for row in rows) if rows else 1
     rows = [row + [""] * (max_cols - len(row)) for row in rows]
