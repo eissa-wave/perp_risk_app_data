@@ -86,22 +86,19 @@ OKX_MGN_RATIO_TARGET = 1.33
 BN_MGN_RATIO_FLOOR = 1.5
 BN_MGN_RATIO_TARGET = 1.33
 
-# Funding: collected funding is summed per symbol from FUNDING_START_MS to now.
-# This is funding accrued on currently-open positions over the lookback window,
-# not strictly "since this position opened". Override with an absolute ms epoch
-# via env (FUNDING_START_MS); default is a 90-day lookback.
-FUNDING_START_MS = int(
-    os.environ.get("FUNDING_START_MS", str(int((time.time() - 90 * 86400) * 1000)))
-)
-
 # ============================================================
 #  STRATEGY START DATES (hardcoded, by base ticker)
 # ============================================================
 # Trade entry date per funding-arb strategy, keyed by the normalized base
 # ticker (the same key the Strategy PnL section groups on, e.g. "VVV", "XMR",
-# "CL"). Used to annualize collected funding: ann% = (funding / avg notional)
-# * (365 / days since start) * 100. Strategies missing from this map show a
-# blank annualized column. Update when entering/rolling a new strategy.
+# "CL"). Two uses:
+#   1. Annualizing collected funding: ann% = (funding / avg notional)
+#      * (365 / days since start) * 100.
+#   2. Anchoring the funding window: for a mapped ticker, only funding events
+#      on or after its start date are summed, so each strategy's funding is
+#      measured since entry, never a trailing window.
+# Strategies missing from this map show a blank annualized column and use the
+# global FUNDING_START_MS window. Update when entering/rolling a new strategy.
 STRATEGY_START_DATES = {
     # "TICKER": "YYYY-MM-DD",
     "VVV": "2026-06-10",
@@ -111,6 +108,34 @@ STRATEGY_START_DATES = {
     "NVDA": "2026-07-07",
 
 }
+
+
+def _date_to_ms(date_str: str):
+    try:
+        dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except (TypeError, ValueError):
+        return None
+
+
+def _min_strategy_start_ms() -> int:
+    """Earliest strategy start date in ms. Fixed anchor for the funding fetch
+    window so totals are stable run to run (the old now-90d default rolled
+    forward every run, silently dropping old events and swinging the sums)."""
+    starts = [ms for ms in (_date_to_ms(s) for s in STRATEGY_START_DATES.values()) if ms]
+    if starts:
+        return min(starts)
+    # No strategies mapped: fall back to a fixed epoch, NOT a rolling window.
+    return _date_to_ms("2026-01-01")
+
+
+# Funding: collected funding is summed per symbol from FUNDING_START_MS to now,
+# further clipped per symbol to that strategy's start date when mapped in
+# STRATEGY_START_DATES. Override the global start with an absolute ms epoch via
+# env (FUNDING_START_MS); default is the earliest strategy start date (fixed).
+FUNDING_START_MS = int(
+    os.environ.get("FUNDING_START_MS", str(_min_strategy_start_ms()))
+)
 
 # Hide dust: position rows with absolute notional below this are excluded from
 # the sheet (Per-Position Detail and Strategy PnL legs). They still count in
@@ -178,17 +203,34 @@ def _removable_cross_binding(cross_positions: list, account_equity: float) -> fl
 
 
 # ============================================================
-#  FUNDING (collected funding per symbol over the lookback window)
+#  FUNDING (collected funding per symbol, clipped per strategy)
 # ============================================================
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _funding_start_for(symbol: str) -> int:
+    """Effective funding-window start for a venue symbol: the strategy start
+    date when the normalized ticker is mapped, else the global window start."""
+    start_str = STRATEGY_START_DATES.get(_strategy_key(symbol))
+    if start_str:
+        ms = _date_to_ms(start_str)
+        if ms:
+            return max(ms, 0)
+    return FUNDING_START_MS
+
+
 def _hl_funding_by_coin(session, dex: str, start_ms: int, end_ms: int,
                         timeout: int, retries: int, backoff_s: float) -> dict:
     """Sum HL funding (delta.usdc, positive = received) per coin for one dex,
-    paginating via the last event time. Keyed by raw coin name."""
+    paginating via the last event time. Keyed by raw coin name.
+
+    Pagination re-fetches from the last timestamp inclusive (cur = last_time,
+    not last_time + 1) and dedups on (time, coin, usdc) so events sharing the
+    boundary timestamp of a full page are never dropped. Per-coin clipping to
+    the strategy start date happens here."""
     totals: dict = {}
+    seen = set()
     cur = start_ms
     pages = 0
     while pages < 10_000:
@@ -200,17 +242,29 @@ def _hl_funding_by_coin(session, dex: str, start_ms: int, end_ms: int,
         if not data:
             break
         for ev in data:
+            t = ev.get("time")
             delta = ev.get("delta") or {}
             coin = delta.get("coin")
             usdc = delta.get("usdc")
-            if coin is not None and usdc is not None:
-                totals[coin] = totals.get(coin, 0.0) + float(usdc)
+            if coin is None or usdc is None:
+                continue
+            key = (t, coin, usdc)
+            if key in seen:
+                continue
+            seen.add(key)
+            if t is not None and int(t) < _funding_start_for(coin):
+                continue
+            totals[coin] = totals.get(coin, 0.0) + float(usdc)
         if len(data) < 500:
             break
         last_time = data[-1].get("time")
         if last_time is None:
             break
-        cur = int(last_time) + 1
+        next_cur = int(last_time)
+        if next_cur <= cur:
+            # whole page at one timestamp: forced bump to escape, else we loop
+            next_cur = cur + 1
+        cur = next_cur
         if cur > end_ms:
             break
     return totals
@@ -218,11 +272,17 @@ def _hl_funding_by_coin(session, dex: str, start_ms: int, end_ms: int,
 
 def _binance_funding_by_symbol(start_ms: int, end_ms: int) -> dict:
     """Sum Binance FUNDING_FEE income (negative = paid) per symbol across all
-    symbols, paginating via the last event time."""
+    symbols, paginating via the last event time.
+
+    Pagination re-fetches from the last timestamp inclusive and dedups on
+    tranId (fallback: time/symbol/income tuple) so boundary-timestamp events
+    are never dropped. Per-symbol clipping to the strategy start date happens
+    here."""
     base_url = "https://fapi.binance.com"
     path = "/fapi/v1/income"
     limit = 1000
     totals: dict = {}
+    seen = set()
     current_start = start_ms
     while True:
         params = {
@@ -243,20 +303,33 @@ def _binance_funding_by_symbol(start_ms: int, end_ms: int) -> dict:
         if not batch:
             break
         for x in batch:
-            if x.get("incomeType") == "FUNDING_FEE":
-                sym = x.get("symbol")
-                totals[sym] = totals.get(sym, 0.0) + float(x.get("income") or 0)
+            if x.get("incomeType") != "FUNDING_FEE":
+                continue
+            key = x.get("tranId") or (x.get("time"), x.get("symbol"), x.get("income"))
+            if key in seen:
+                continue
+            seen.add(key)
+            sym = x.get("symbol")
+            t = x.get("time")
+            if t is not None and int(t) < _funding_start_for(sym):
+                continue
+            totals[sym] = totals.get(sym, 0.0) + float(x.get("income") or 0)
         if len(batch) < limit:
             break
         last_time = max(int(x["time"]) for x in batch)
-        current_start = last_time + 1
+        if last_time <= current_start:
+            # whole page at one timestamp: forced bump to escape, else we loop
+            current_start = current_start + 1
+        else:
+            current_start = last_time
         time.sleep(0.2)
     return totals
 
 
 def _okx_funding_by_inst(start_ms: int, end_ms: int, timeout: int) -> dict:
     """Sum OKX funding-fee bills (type=8, amount in `pnl`, negative = paid) per
-    instId. Queries both the 7-day and archive endpoints and dedups by billId."""
+    instId. Queries both the 7-day and archive endpoints and dedups by billId.
+    Per-instId clipping to the strategy start date is applied via each bill's ts."""
     limit = 100
     all_rows = []
     for path in ("/api/v5/account/bills", "/api/v5/account/bills-archive"):
@@ -295,6 +368,12 @@ def _okx_funding_by_inst(start_ms: int, end_ms: int, timeout: int) -> dict:
             continue
         seen.add(bid)
         inst = r.get("instId")
+        try:
+            ts = int(r.get("ts") or 0)
+        except (TypeError, ValueError):
+            ts = 0
+        if ts and ts < _funding_start_for(inst):
+            continue
         totals[inst] = totals.get(inst, 0.0) + float(r.get("pnl") or 0)
     return totals
 
@@ -1130,10 +1209,10 @@ def write_to_sheet(results: list) -> None:
     rows.append(["Binance mgnRatio floor", f"{BN_MGN_RATIO_FLOOR:.2f}x  (for cross positions without per-position liq prices)"])
     rows.append(["Binance mgnRatio target", f"{BN_MGN_RATIO_TARGET:.2f}x"])
     _fund_since = datetime.fromtimestamp(FUNDING_START_MS / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    rows.append(["Funding window", f"collected since {_fund_since}"])
+    rows.append(["Funding window", f"fixed global start {_fund_since}; mapped strategies clipped to their STRATEGY_START_DATES entry"])
     if MIN_POSITION_USD > 0:
         rows.append(["Small balance filter", f"positions under ${MIN_POSITION_USD:,.0f} notional hidden ({hidden_count} hidden this run); still included in risk math"])
-    rows.append(["Strategy note", "Funding/Notional (%) = total funding / avg abs leg notional. Annualized = that % * 365/days since hardcoded start date (STRATEGY_START_DATES). Funding window must cover the start date or the annualized figure understates."])
+    rows.append(["Strategy note", "Funding/Notional (%) = total funding / avg abs leg notional. Annualized = that % * 365/days since hardcoded start date (STRATEGY_START_DATES). Mapped strategies sum funding only from their start date, so the annualized figure is exact for them."])
 
     max_cols = max(len(row) for row in rows) if rows else 1
     rows = [row + [""] * (max_cols - len(row)) for row in rows]
