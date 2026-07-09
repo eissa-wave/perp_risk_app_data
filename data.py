@@ -103,7 +103,6 @@ STRATEGY_START_DATES = {
     # "TICKER": "YYYY-MM-DD",
     "VVV": "2026-06-10",
     "CL": "2026-06-10",
-    "MU": "2026-06-11",
     "TRUMP": "2026-06-16",
     "NVDA": "2026-07-07",
 
