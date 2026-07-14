@@ -12,6 +12,8 @@ Jenkins setup:
   Optional environment variables:
     HL_USER          -- Hyperliquid wallet to monitor
     HL_DEXS          -- comma-separated dexs; "" is main, add HIP-3 builders (default ",xyz")
+    LIGHTER_ACCOUNT_INDEX  -- Lighter account index to monitor; unset skips Lighter entirely
+    LIGHTER_BASE_URL       -- default "https://mainnet.zklighter.elliot.ai"
     SHEET_NAME       -- default "Portfolios"
     TAB_RISK         -- default "perp_monitor"
 
@@ -85,6 +87,14 @@ OKX_MGN_RATIO_TARGET = 1.33
 # Used as the fallback when Binance cross positions don't return a liq price.
 BN_MGN_RATIO_FLOOR = 1.5
 BN_MGN_RATIO_TARGET = 1.33
+
+LIGHTER_BASE_URL = os.environ.get("LIGHTER_BASE_URL", "https://mainnet.zklighter.elliot.ai")
+# Account/position data on Lighter is public (query by account index, no API
+# key or request signing needed). Leave unset to skip Lighter entirely.
+LIGHTER_ACCOUNT_INDEX = os.environ.get("LIGHTER_ACCOUNT_INDEX")
+# Same framing as OKX/Binance: account equity / maintenance margin requirement.
+LIGHTER_MGN_RATIO_FLOOR = 1.5
+LIGHTER_MGN_RATIO_TARGET = 1.33
 
 # ============================================================
 #  STRATEGY START DATES (hardcoded, by base ticker)
@@ -1055,6 +1065,135 @@ def get_okx_positions():
     }
 
 
+def get_lighter_positions():
+    """Lighter is a zk-rollup orderbook perp DEX. Account/position data is
+    public (GET /api/v1/account?by=index&value=<account index>), so unlike
+    the other venues this needs no API key or request signing -- just an
+    account index.
+
+    Field mapping mirrors OKX's cross-margin model: cross_asset_value is
+    mark-to-market equity, available_balance is withdrawable, and
+    cross_maintenance_margin_requirement plays the role of OKX's mmr, so the
+    same floor/target margin-ratio framing is reused here.
+
+    NOTE ON FUNDING: the public account endpoint only exposes lifetime-
+    cumulative funding per position (total_funding_paid_out). Windowed or
+    24h funding requires a signed auth token (the positionFunding endpoint),
+    which needs the Lighter SDK's signer and is out of scope for a read-only
+    monitor. So funding_collected below is lifetime, NOT clipped to
+    STRATEGY_START_DATES like the other venues, and funding_24h is always
+    None -- see the "Strategy note" row in the sheet.
+    """
+    if not LIGHTER_ACCOUNT_INDEX:
+        _log("  Lighter: LIGHTER_ACCOUNT_INDEX not set, skipping.")
+        return []
+
+    timeout = 15
+
+    def _f(v):
+        try:
+            return float(v) if v is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    resp = requests.get(
+        f"{LIGHTER_BASE_URL}/api/v1/account",
+        params={"by": "index", "value": LIGHTER_ACCOUNT_INDEX, "active_only": "true"},
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    accounts = data.get("accounts") or []
+    acct = accounts[0] if accounts else {}
+
+    raw_positions = [p for p in (acct.get("positions") or []) if _f(p.get("position")) != 0]
+
+    long_delta = short_delta = 0.0
+    position_rows = []
+    isolated_removables = []
+    cross_position_inputs = []
+
+    for p in raw_positions:
+        symbol = p.get("symbol", "")
+        sign_val = 1 if int(p.get("sign", 1) or 1) >= 0 else -1
+        direction = "LONG" if sign_val > 0 else "SHORT"
+        size = abs(_f(p.get("position")))
+        pos_value = abs(_f(p.get("position_value")))
+        mark = pos_value / size if size > 0 else 0.0
+        signed_notional = sign_val * pos_value
+
+        if signed_notional > 0:
+            long_delta += signed_notional
+        else:
+            short_delta += signed_notional
+
+        liq_str = p.get("liquidation_price")
+        liq_px = _f(liq_str) if liq_str not in (None, "") else 0.0
+        liq_px = liq_px if liq_px > 0 else None
+        dist_pct = abs((mark - liq_px) / mark) * 100 if (liq_px and mark) else None
+
+        is_isolated = int(p.get("margin_mode", 0) or 0) == 1
+        margin_mode = "isolated" if is_isolated else "cross"
+        signed_size = sign_val * size
+
+        iso_rem = None
+        if is_isolated and liq_px and mark:
+            iso_rem = _removable_isolated_position(direction, signed_size, mark, liq_px)
+            isolated_removables.append((symbol, iso_rem))
+        elif (not is_isolated) and liq_px and mark:
+            cross_position_inputs.append({"name": symbol, "size": signed_size, "mark": mark, "liq": liq_px})
+
+        funding_life = p.get("total_funding_paid_out")
+        position_rows.append({
+            "exchange": "Lighter", "symbol": symbol, "direction": direction,
+            "size": size, "notional": signed_notional, "mark": mark, "liq": liq_px,
+            "dist_pct": dist_pct, "margin_mode": margin_mode, "isolated_removable": iso_rem,
+            "funding_collected": _f(funding_life) if funding_life is not None else None,
+            "funding_24h": None,  # lifetime-cumulative only; see docstring
+        })
+
+    net_delta = long_delta + short_delta
+    gross_notional = long_delta + abs(short_delta)
+    account_equity = _f(acct.get("cross_asset_value"))
+    withdrawable = _f(acct.get("available_balance"))
+    mmr = _f(acct.get("cross_maintenance_margin_requirement"))
+    mgn_ratio = account_equity / mmr if mmr > 0 else float("inf")
+    leverage = gross_notional / account_equity if account_equity > 0 else 0.0
+
+    # Count cross positions without a per-position liq price (edge case; Lighter
+    # normally reports one even for cross). Account-level mgnRatio is the
+    # fallback safety signal for these, mirroring the Binance/OKX pattern.
+    cross_no_liq_count = sum(
+        1 for r in position_rows if r["dist_pct"] is None and r["margin_mode"] != "isolated"
+    )
+
+    measurable = [r for r in position_rows if r["dist_pct"] is not None]
+    if not raw_positions:
+        excess = True
+    else:
+        per_pos_ok = min(r["dist_pct"] for r in measurable) > LIQ_DISTANCE_THRESHOLD_PCT if measurable else True
+        account_ok = (mgn_ratio > LIGHTER_MGN_RATIO_FLOOR) if cross_no_liq_count > 0 else True
+        excess = per_pos_ok and account_ok
+
+    iso_sum = sum(max(amt, 0.0) for _, amt in isolated_removables)
+    cross_cap = _removable_cross_binding(cross_position_inputs, account_equity)
+    if cross_no_liq_count > 0 and mgn_ratio > LIGHTER_MGN_RATIO_TARGET:
+        account_cap = max(0.0, account_equity - mmr * LIGHTER_MGN_RATIO_TARGET)
+    else:
+        account_cap = 0.0
+    pos_constrained = iso_sum + cross_cap + account_cap
+    removable_total = max(0.0, min(pos_constrained, withdrawable))
+
+    return [{
+        "exchange": "Lighter", "currency": "USDC", "positions_count": len(raw_positions),
+        "position_rows": position_rows, "long_delta": long_delta, "short_delta": short_delta,
+        "net_delta": net_delta, "gross_notional": gross_notional, "leverage": leverage,
+        "account_equity": account_equity, "withdrawable": withdrawable,
+        "excess_collateral": excess, "removable_total": removable_total,
+        "mgn_ratio": mgn_ratio if mgn_ratio != float("inf") else None,
+    }]
+
+
 # ============================================================
 #  GOOGLE SHEETS WRITER
 # ============================================================
@@ -1242,7 +1381,7 @@ def write_to_sheet(results: list) -> None:
     rows.append(["Funding window", f"fixed global start {_fund_since}; mapped strategies clipped to their STRATEGY_START_DATES entry"])
     if MIN_POSITION_USD > 0:
         rows.append(["Small balance filter", f"positions under ${MIN_POSITION_USD:,.0f} notional hidden ({hidden_count} hidden this run); still included in risk math"])
-    rows.append(["Strategy note", "Funding/Notional (%) = total funding / avg abs leg notional. Annualized = that % * 365/days since hardcoded start date (STRATEGY_START_DATES). Mapped strategies sum funding only from their start date, so the annualized figure is exact for them. 24 Hr Funding = funding events in the trailing 24h; Bybit legs are excluded (curRealisedPnl has no time breakdown), so strategies with a Bybit leg understate."])
+    rows.append(["Strategy note", "Funding/Notional (%) = total funding / avg abs leg notional. Annualized = that % * 365/days since hardcoded start date (STRATEGY_START_DATES). Mapped strategies sum funding only from their start date, so the annualized figure is exact for them. 24 Hr Funding = funding events in the trailing 24h; Bybit and Lighter legs are excluded (no time breakdown available), so strategies with either leg understate 24 Hr Funding. Lighter's Total Funding is lifetime-cumulative (not clipped to strategy start), so strategies with a Lighter leg may overstate Funding/Notional and Annualized."])
 
     max_cols = max(len(row) for row in rows) if rows else 1
     rows = [row + [""] * (max_cols - len(row)) for row in rows]
@@ -1263,6 +1402,7 @@ def main() -> int:
         ("Binance", get_binance_positions),
         ("Bybit", get_bybit_positions),
         ("OKX", get_okx_positions),
+        ("Lighter", get_lighter_positions),
     ]
 
     for name, fn in fetchers:
