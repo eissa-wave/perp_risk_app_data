@@ -112,10 +112,10 @@ LIGHTER_MGN_RATIO_TARGET = 1.33
 STRATEGY_START_DATES = {
     # "TICKER": "YYYY-MM-DD",
     "VVV": "2026-06-10",
-    "CL": "2026-06-10",
     "JTO": "2026-07-10",
     "LIT": "2026-07-10",
     "SPCX": "2026-07-14",
+    "BRENT": "2026-07-22,"
 
 }
 
