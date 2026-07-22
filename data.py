@@ -115,8 +115,17 @@ STRATEGY_START_DATES = {
     "JTO": "2026-07-10",
     "LIT": "2026-07-10",
     "SPCX": "2026-07-14",
-    "BRENT": "2026-07-22,"
+    "BRENT": "2026-07-22",
+}
 
+# Venue-specific tickers that refer to the same underlying strategy but don't
+# share a common normalized base symbol (e.g. HL lists it as "BRENTOIL", while
+# Binance's spot/perp symbol for the same crude-oil proxy is "BZUSDT" -> "BZ").
+# Map each raw normalized key to the canonical STRATEGY_START_DATES key so both
+# legs group into one Strategy PnL row. Add future mismatches here.
+STRATEGY_ALIASES = {
+    "BRENTOIL": "BRENT",   # Hyperliquid xyz:xyz:BRENTOIL
+    "BZ": "BRENT",         # Binance BZUSDT
 }
 
 
@@ -1217,7 +1226,13 @@ def _strategy_key(symbol: str) -> str:
     """Normalize a venue symbol to its base asset so legs of the same funding-arb
     strategy group together. Examples:
       VVVUSDT -> VVV, XMRUSDT -> XMR, VVV -> VVV,
-      xyz:xyz:CL -> CL, CL-USDT-SWAP -> CL."""
+      xyz:xyz:CL -> CL, CL-USDT-SWAP -> CL,
+      xyz:xyz:BRENTOIL -> BRENT (alias), BZUSDT -> BZ -> BRENT (alias).
+
+    Some venues label the same underlying strategy with different tickers
+    (e.g. HL's BRENTOIL vs Binance's BZUSDT). After normalizing venue prefixes
+    and quote suffixes, STRATEGY_ALIASES maps such raw keys onto one canonical
+    key so both legs land in the same Strategy PnL row."""
     s = symbol or ""
     if ":" in s:           # HL builder/dex prefixes: keep the trailing coin
         s = s.split(":")[-1]
@@ -1225,8 +1240,9 @@ def _strategy_key(symbol: str) -> str:
         s = s.split("-")[0]
     for q in ("USDT", "USDC", "USD"):   # Binance BASEUSDT style
         if s.endswith(q) and len(s) > len(q):
-            return s[: -len(q)]
-    return s
+            s = s[: -len(q)]
+            break
+    return STRATEGY_ALIASES.get(s, s)
 
 
 def write_to_sheet(results: list) -> None:
