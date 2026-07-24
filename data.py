@@ -412,12 +412,27 @@ def _binance_funding_by_symbol(start_ms: int, end_ms: int) -> tuple:
     return totals, totals_24h, totals_mtd, totals_ytd
 
 
-def _okx_funding_by_inst(start_ms: int, end_ms: int, timeout: int) -> tuple:
+def _okx_funding_by_inst(end_ms: int, timeout: int) -> tuple:
     """Sum OKX funding-fee bills (type=8, amount in `pnl`, negative = paid) per
     instId. Queries both the 7-day and archive endpoints and dedups by billId.
-    Per-instId clipping to the strategy start date is applied via each bill's
-    ts. Returns (totals, totals_24h, totals_mtd, totals_ytd)."""
+
+    Deliberately does NOT pass begin/end to OKX -- passing them alongside the
+    `after` pagination cursor on /account/bills-archive was silently dropping
+    entire instruments from the result (confirmed: a standalone pull with no
+    begin/end found 12 bills / $2,258.43 for an instrument that returned
+    nothing when begin/end were set, even though its bills fell well inside
+    that window). Instead this fetches the full retained history via `after`
+    alone, with a generous client-side time floor to bound pagination, and
+    all windowing (24h/MTD/YTD/since-strategy-start) is applied client-side
+    on the ts field after the fact -- same approach as the standalone
+    okx_funding_pull.py sanity-check script.
+
+    Returns (totals, totals_24h, totals_mtd, totals_ytd)."""
     limit = 100
+    # Safety floor so a very old/long-lived account doesn't paginate forever;
+    # comfortably covers YTD plus a buffer. Not the cause of the bug above --
+    # just a sane bound now that server-side begin/end is no longer used.
+    floor_ms = end_ms - 400 * 86_400_000
     all_rows = []
     for path in ("/api/v5/account/bills", "/api/v5/account/bills-archive"):
         after = None
@@ -425,10 +440,6 @@ def _okx_funding_by_inst(start_ms: int, end_ms: int, timeout: int) -> tuple:
         while guard < 1000:
             guard += 1
             params = {"instType": "SWAP", "type": "8", "limit": str(limit)}
-            if start_ms is not None:
-                params["begin"] = str(start_ms)
-            if end_ms is not None:
-                params["end"] = str(end_ms)
             if after is not None:
                 params["after"] = str(after)
             try:
@@ -443,6 +454,12 @@ def _okx_funding_by_inst(start_ms: int, end_ms: int, timeout: int) -> tuple:
             try:
                 after = min(int(r["billId"]) for r in rows if r.get("billId"))
             except (ValueError, KeyError):
+                break
+            try:
+                oldest_ts_in_page = min(int(r["ts"]) for r in rows if r.get("ts"))
+            except (ValueError, KeyError):
+                oldest_ts_in_page = None
+            if oldest_ts_in_page is not None and oldest_ts_in_page < floor_ms:
                 break
             if len(rows) < limit:
                 break
@@ -1132,7 +1149,7 @@ def get_okx_positions():
 
     try:
         funding_by_inst, funding_24h_by_inst, funding_mtd_by_inst, funding_ytd_by_inst = (
-            _okx_funding_by_inst(FUNDING_FETCH_START_MS, _now_ms(), timeout)
+            _okx_funding_by_inst(_now_ms(), timeout)
         )
     except Exception as exc:
         print(f"  [OKX funding warning] {exc}")
@@ -1257,8 +1274,13 @@ def get_lighter_positions():
     24h funding requires a signed auth token (the positionFunding endpoint),
     which needs the Lighter SDK's signer and is out of scope for a read-only
     monitor. So funding_collected below is lifetime, NOT clipped to
-    STRATEGY_START_DATES like the other venues, and funding_24h/funding_mtd/
-    funding_ytd are always None -- see the "Strategy note" row in the sheet.
+    STRATEGY_START_DATES like the other venues, and funding_24h/funding_mtd
+    are always None -- see the "Strategy note" row in the sheet. funding_ytd
+    is populated as lifetime-cumulative too: this is EXACT as long as the
+    position has accrued no funding before Jan 1 of the current year, which
+    holds for every position opened this year (true for all mapped
+    strategies today), but would overstate YTD for a position with funding
+    history stretching back to a prior year.
     """
     if not LIGHTER_ACCOUNT_INDEX:
         _log("  Lighter: LIGHTER_ACCOUNT_INDEX not set, skipping.")
@@ -1369,10 +1391,15 @@ def get_lighter_positions():
         "account_equity": account_equity, "withdrawable": withdrawable,
         "excess_collateral": excess, "removable_total": removable_total,
         "mgn_ratio": mgn_ratio if mgn_ratio != float("inf") else None,
-        # Lighter's public API has no windowed funding (lifetime-cumulative
-        # only), so it can't contribute to MTD/YTD totals or Funding by Strategy.
+        # No windowed funding available (lifetime-cumulative only, see
+        # docstring), so MTD is never populated. YTD uses lifetime-cumulative
+        # as an exact proxy for positions with no funding history before this
+        # year -- see docstring caveat.
         "funding_mtd_by_symbol": {},
-        "funding_ytd_by_symbol": {},
+        "funding_ytd_by_symbol": {
+            p["symbol"]: p["funding_collected"]
+            for p in position_rows if p.get("funding_collected") is not None
+        },
     }]
 
 
@@ -1629,6 +1656,40 @@ def write_to_sheet(results: list) -> None:
     for exch, sym, status, fmtd, fytd in sorted(leg_funding_rows, key=lambda x: -abs(x[4])):
         rows.append([exch, sym, status, _fmt_num(fmtd), _fmt_num(fytd)])
 
+    # ---- Data Gaps: currently open positions where the funding fetch found
+    # no meaningful MTD/YTD data (key absent entirely, or present but summing
+    # to exactly zero). This is what actually causes a leg to be missing/thin
+    # in Funding by Strategy and Funding by Leg above -- surfacing it here
+    # turns a silent gap into something checkable. Common real causes: (1)
+    # Lighter's public API only exposes lifetime-cumulative funding, not MTD
+    # (see Strategy note); (2) an OKX/Bybit leg booked as a dated future,
+    # spot, or margin position rather than a perpetual swap won't generate
+    # SWAP funding-fee bills at all, since those instrument types don't have
+    # periodic funding; (3) a genuine fetch/pagination gap against the
+    # exchange API for that window. ----
+    gap_rows = []
+    for r in results:
+        mtd_dict = r.get("funding_mtd_by_symbol") or {}
+        ytd_dict = r.get("funding_ytd_by_symbol") or {}
+        for p in r["position_rows"]:
+            sym = p["symbol"]
+            fmtd = mtd_dict.get(sym)
+            fytd = ytd_dict.get(sym)
+            if (fmtd is None or fmtd == 0.0) and (fytd is None or fytd == 0.0):
+                gap_rows.append((r["exchange"], sym, fmtd, fytd))
+
+    rows.append([])
+    rows.append(["Data Gaps (open positions with no meaningful funding data captured)"])
+    rows.append(["Exchange", "Symbol", "Funding MTD", "Funding YTD"])
+    for exch, sym, fmtd, fytd in sorted(set(gap_rows), key=lambda x: (x[0], x[1])):
+        rows.append([
+            exch, sym,
+            _fmt_num(fmtd) if fmtd is not None else "(no data)",
+            _fmt_num(fytd) if fytd is not None else "(no data)",
+        ])
+    if not gap_rows:
+        rows.append(["(none -- every open position has funding data)", "", "", ""])
+
     rows.append([])
     rows.append(["Thresholds"])
     rows.append(["Liq distance threshold", f">{LIQ_DISTANCE_THRESHOLD_PCT:.0f}%"])
@@ -1658,11 +1719,19 @@ def write_to_sheet(results: list) -> None:
         "figures (in both Funding Totals and Funding by Strategy) come from its transaction "
         "log (a real per-event ledger sum), separate from and not necessarily matching the "
         "curRealisedPnl proxy used for Active Strategies. Lighter has no windowed funding "
-        "available from its public API (lifetime-cumulative only), so it never contributes "
-        "to Funding Totals or Funding by Strategy. Funding by Leg is the same MTD/YTD data "
-        "un-aggregated: one row per (exchange, symbol), tagged Open/Closed, whether or not "
-        "it's a currently open position -- use this for the leg-level funding detail that "
-        "Per-Position Detail above can't show for closed legs."])
+        "API (lifetime-cumulative only); its YTD figure uses lifetime-cumulative funding as "
+        "an exact proxy (valid as long as the position has no funding history before this "
+        "calendar year -- true for every position opened this year), but Lighter never "
+        "contributes an MTD figure, and a fully closed Lighter position loses its funding "
+        "history entirely (the public API only reports currently-held positions). Funding by "
+        "Leg is the same MTD/YTD data un-aggregated: one row per (exchange, symbol), tagged "
+        "Open/Closed, whether or not it's a currently open position -- use this for the "
+        "leg-level funding detail that Per-Position Detail above can't show for closed legs. "
+        "Data Gaps flags every currently open position where no meaningful MTD/YTD funding "
+        "was captured (key absent or summing to exactly zero) -- this is what actually causes "
+        "a leg to look thin or missing above; common causes are Lighter's MTD limitation, an "
+        "OKX/Bybit leg booked as a dated future/spot/margin position (no periodic funding "
+        "exists for those instrument types), or a genuine fetch gap against the exchange API."])
 
     max_cols = max(len(row) for row in rows) if rows else 1
     rows = [row + [""] * (max_cols - len(row)) for row in rows]
