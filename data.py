@@ -606,7 +606,7 @@ def _get_hl_dex_positions(session, dex: str, timeout: int, retries: int, backoff
         # Full per-symbol MTD/YTD funding for this dex, across every coin that
         # had funding activity in the window -- NOT limited to currently open
         # positions. Used for the top-level Funding Totals figure and the
-        # Past Strategies table (closed/rolled-off legs still show up here).
+        # Funding by Strategy table (closed/rolled-off legs still show up here).
         "funding_mtd_by_symbol": {f"{prefix}{c}": v for c, v in (funding_mtd_by_coin or {}).items()},
         "funding_ytd_by_symbol": {f"{prefix}{c}": v for c, v in (funding_ytd_by_coin or {}).items()},
         # raw components for the unified-mode combiner (stripped before sheet write)
@@ -1370,7 +1370,7 @@ def get_lighter_positions():
         "excess_collateral": excess, "removable_total": removable_total,
         "mgn_ratio": mgn_ratio if mgn_ratio != float("inf") else None,
         # Lighter's public API has no windowed funding (lifetime-cumulative
-        # only), so it can't contribute to MTD/YTD totals or Past Strategies.
+        # only), so it can't contribute to MTD/YTD totals or Funding by Strategy.
         "funding_mtd_by_symbol": {},
         "funding_ytd_by_symbol": {},
     }]
@@ -1573,16 +1573,15 @@ def write_to_sheet(results: list) -> None:
             _fmt_num(ann_pct, 2) if (ann_pct is not None and g["has_funding"]) else "",
         ])
 
-    # ---- Past Strategies: strategies with at least one leg no longer open
-    # at its venue (closed or rolled-off). Once a strategy qualifies, show
-    # funding from EVERY venue it has ever traded on in the window -- not just
-    # the closed leg -- since Active Strategies only aggregates over currently
-    # open legs, and a partially-closed multi-venue strategy (e.g. Hyperliquid
-    # leg closed, Binance leg still open) would otherwise show an incomplete
-    # picture here. ----
-    strat_all: dict = {}
+    # ---- Funding by Strategy: total MTD/YTD funding for every ticker with
+    # funding activity in the window, across every venue -- both currently
+    # open positions AND fully closed/rolled-off ones. Venue-specific tickers
+    # (e.g. HL's BRENTOIL vs Binance's BZUSDT) are normalized/aliased via
+    # _strategy_key so both legs land on one combined row. This is a flat
+    # list, one row per ticker; summing its Funding MTD/YTD columns should
+    # reconcile to the top-level Funding Totals above. ----
+    strat_funding: dict = {}
     for r in results:
-        open_syms = {p["symbol"] for p in r["position_rows"]}
         mtd_dict = r.get("funding_mtd_by_symbol") or {}
         ytd_dict = r.get("funding_ytd_by_symbol") or {}
         for sym in set(mtd_dict) | set(ytd_dict):
@@ -1591,24 +1590,16 @@ def write_to_sheet(results: list) -> None:
             if fmtd == 0.0 and fytd == 0.0:
                 continue
             key = _strategy_key(sym)
-            entry = strat_all.setdefault(key, {"venues": set(), "funding_mtd": 0.0,
-                                               "funding_ytd": 0.0, "has_closed_leg": False})
+            entry = strat_funding.setdefault(key, {"venues": set(), "funding_mtd": 0.0, "funding_ytd": 0.0})
             entry["venues"].add(r["exchange"])
             entry["funding_mtd"] += fmtd
             entry["funding_ytd"] += fytd
-            if sym not in open_syms:
-                entry["has_closed_leg"] = True
-
-    # Fully active strategies (every leg still open, everywhere) are already
-    # fully represented in Active Strategies above; only surface the ones with
-    # at least one closed/rolled-off leg.
-    closed_strat = {k: v for k, v in strat_all.items() if v["has_closed_leg"]}
 
     rows.append([])
-    rows.append(["Past Strategies (strategies with at least one closed leg)"])
+    rows.append(["Funding by Strategy (MTD/YTD, all tickers, active + previous)"])
     rows.append(["Strategy", "Venues", "Funding MTD", "Funding YTD"])
-    for key in sorted(closed_strat, key=lambda k: -abs(closed_strat[k]["funding_ytd"])):
-        entry = closed_strat[key]
+    for key in sorted(strat_funding, key=lambda k: -abs(strat_funding[k]["funding_ytd"])):
+        entry = strat_funding[key]
         rows.append([
             key, ", ".join(sorted(entry["venues"])),
             _fmt_num(entry["funding_mtd"]), _fmt_num(entry["funding_ytd"]),
@@ -1635,18 +1626,16 @@ def write_to_sheet(results: list) -> None:
         "over currently open legs; Funding/Notional (%) and Funding Annualized (%) are "
         "derived from that figure, not from MTD/YTD. 24 Hr Funding = funding events in the "
         "trailing 24h; Bybit and Lighter legs are excluded from that column (no time "
-        "breakdown available there). Past Strategies covers any strategy with at least one "
-        "leg no longer open at its venue: once a strategy qualifies, its row sums MTD/YTD "
-        "funding from EVERY venue it has traded on in the window, including legs that are "
-        "still open elsewhere (e.g. Hyperliquid leg closed, Binance leg still live), so the "
-        "row shows the full picture rather than just the closed leg. Strategies with every "
-        "leg still open everywhere don't appear here at all -- they're fully covered by "
-        "Active Strategies. Bybit's MTD/YTD figures (in both Funding Totals and Past "
-        "Strategies) come from its transaction log (a real per-event ledger sum), separate "
-        "from and not necessarily matching the curRealisedPnl proxy used for Active "
-        "Strategies. Lighter has no windowed funding available from its public API "
-        "(lifetime-cumulative only), so it never contributes to Funding Totals or Past "
-        "Strategies."])
+        "breakdown available there). Funding by Strategy is a flat MTD/YTD breakdown for "
+        "every ticker with funding activity in the window, active or fully closed, summed "
+        "across every venue it traded on (so e.g. Hyperliquid's BRENTOIL and Binance's "
+        "BZUSDT land on one combined BRENT row); summing this table's Funding MTD/YTD "
+        "columns should reconcile to the top-level Funding Totals above. Bybit's MTD/YTD "
+        "figures (in both Funding Totals and Funding by Strategy) come from its transaction "
+        "log (a real per-event ledger sum), separate from and not necessarily matching the "
+        "curRealisedPnl proxy used for Active Strategies. Lighter has no windowed funding "
+        "available from its public API (lifetime-cumulative only), so it never contributes "
+        "to Funding Totals or Funding by Strategy."])
 
     max_cols = max(len(row) for row in rows) if rows else 1
     rows = [row + [""] * (max_cols - len(row)) for row in rows]
