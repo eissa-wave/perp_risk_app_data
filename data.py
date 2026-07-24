@@ -603,6 +603,12 @@ def _get_hl_dex_positions(session, dex: str, timeout: int, retries: int, backoff
         "net_delta": net_delta, "gross_notional": gross_notional, "leverage": hl_leverage,
         "account_equity": account_equity, "withdrawable": withdrawable,
         "excess_collateral": excess, "removable_total": removable_total, "mgn_ratio": None,
+        # Full per-symbol MTD/YTD funding for this dex, across every coin that
+        # had funding activity in the window -- NOT limited to currently open
+        # positions. Used for the top-level Funding Totals figure and the
+        # Past Strategies table (closed/rolled-off legs still show up here).
+        "funding_mtd_by_symbol": {f"{prefix}{c}": v for c, v in (funding_mtd_by_coin or {}).items()},
+        "funding_ytd_by_symbol": {f"{prefix}{c}": v for c, v in (funding_ytd_by_coin or {}).items()},
         # raw components for the unified-mode combiner (stripped before sheet write)
         "_iso_removables": isolated_removables,
         "_cross_inputs": cross_position_inputs,
@@ -636,6 +642,8 @@ def _get_hl_unified(session, per_dex: list, timeout: int, retries: int, backoff_
     cross_inputs = []
     long_delta = short_delta = 0.0
     total_upl = 0.0
+    funding_mtd_by_symbol: dict = {}
+    funding_ytd_by_symbol: dict = {}
     for r in per_dex:
         for row in r["position_rows"]:
             row = dict(row)
@@ -646,6 +654,10 @@ def _get_hl_unified(session, per_dex: list, timeout: int, retries: int, backoff_
         long_delta += r["long_delta"]
         short_delta += r["short_delta"]
         total_upl += r.get("_upl", 0.0)
+        for k, v in r.get("funding_mtd_by_symbol", {}).items():
+            funding_mtd_by_symbol[k] = funding_mtd_by_symbol.get(k, 0.0) + v
+        for k, v in r.get("funding_ytd_by_symbol", {}).items():
+            funding_ytd_by_symbol[k] = funding_ytd_by_symbol.get(k, 0.0) + v
 
     net_delta = long_delta + short_delta
     gross_notional = long_delta + abs(short_delta)
@@ -681,6 +693,8 @@ def _get_hl_unified(session, per_dex: list, timeout: int, retries: int, backoff_
         "net_delta": net_delta, "gross_notional": gross_notional, "leverage": hl_leverage,
         "account_equity": account_equity, "withdrawable": withdrawable,
         "excess_collateral": excess, "removable_total": removable_total, "mgn_ratio": None,
+        "funding_mtd_by_symbol": funding_mtd_by_symbol,
+        "funding_ytd_by_symbol": funding_ytd_by_symbol,
     }
 
 
@@ -854,6 +868,10 @@ def get_binance_positions():
         "account_equity": account_equity, "withdrawable": withdrawable,
         "excess_collateral": excess, "removable_total": removable_total,
         "mgn_ratio": bn_mgn_ratio if bn_mgn_ratio != float("inf") else None,
+        # Full per-symbol MTD/YTD funding across every symbol traded, not just
+        # currently open positions -- see note on the HL result above.
+        "funding_mtd_by_symbol": funding_mtd_by_symbol or {},
+        "funding_ytd_by_symbol": funding_ytd_by_symbol or {},
     }
 
 
@@ -1070,6 +1088,8 @@ def get_bybit_positions():
         "net_delta": net_delta, "gross_notional": gross_notional, "leverage": bb_leverage,
         "account_equity": account_equity, "withdrawable": withdrawable,
         "excess_collateral": excess, "removable_total": removable_total, "mgn_ratio": None,
+        "funding_mtd_by_symbol": funding_mtd_by_symbol or {},
+        "funding_ytd_by_symbol": funding_ytd_by_symbol or {},
     }
 
 
@@ -1216,6 +1236,8 @@ def get_okx_positions():
         "net_delta": net_delta, "gross_notional": gross_notional, "leverage": okx_leverage,
         "account_equity": total_eq, "withdrawable": avail_eq,
         "excess_collateral": excess, "removable_total": removable_total, "mgn_ratio": mgn_ratio,
+        "funding_mtd_by_symbol": funding_mtd_by_inst or {},
+        "funding_ytd_by_symbol": funding_ytd_by_inst or {},
     }
 
 
@@ -1347,6 +1369,10 @@ def get_lighter_positions():
         "account_equity": account_equity, "withdrawable": withdrawable,
         "excess_collateral": excess, "removable_total": removable_total,
         "mgn_ratio": mgn_ratio if mgn_ratio != float("inf") else None,
+        # Lighter's public API has no windowed funding (lifetime-cumulative
+        # only), so it can't contribute to MTD/YTD totals or Past Strategies.
+        "funding_mtd_by_symbol": {},
+        "funding_ytd_by_symbol": {},
     }]
 
 
@@ -1470,12 +1496,27 @@ def write_to_sheet(results: list) -> None:
             pos_type,
         ])
 
-    # ---- Strategy PnL: group legs by base asset, sum funding, normalize ----
+    # ---- Funding Totals: top-level MTD/YTD figures across every symbol that
+    # had funding activity in the window, at any account -- including symbols
+    # with no currently open position (closed/rolled-off strategies). This is
+    # deliberately NOT broken out per strategy; it's a single combined number
+    # per window, matching how it should read on the dashboard's top line. ----
+    grand_mtd_total = sum(sum((r.get("funding_mtd_by_symbol") or {}).values()) for r in results)
+    grand_ytd_total = sum(sum((r.get("funding_ytd_by_symbol") or {}).values()) for r in results)
+
     rows.append([])
-    rows.append(["Strategy PnL (funding arb)"])
+    rows.append(["Funding Totals (MTD/YTD, all accounts, all positions ever traded)"])
+    rows.append(["Metric", "Value"])
+    rows.append(["Total Funding Collected MTD", _fmt_num(grand_mtd_total)])
+    rows.append(["Total Funding Collected YTD", _fmt_num(grand_ytd_total)])
+
+    # ---- Active Strategies: group currently-open legs by base asset, sum
+    # funding since each strategy's hardcoded start date, normalize ----
+    rows.append([])
+    rows.append(["Active Strategies (currently open positions)"])
     rows.append([
-        "Strategy", "Legs (venue:dir)", "Total Funding Collected MTD", "Total Funding Collected YTD",
-        "24 Hr Funding", "Avg Leg Size", "Funding / Notional (%)", "Start Date", "Funding Annualized (%)",
+        "Strategy", "Legs (venue:dir)", "Total Funding", "24 Hr Funding",
+        "Avg Leg Size", "Funding / Notional (%)", "Start Date", "Funding Annualized (%)",
     ])
 
     strat: dict = {}
@@ -1483,8 +1524,6 @@ def write_to_sheet(results: list) -> None:
         key = _strategy_key(p["symbol"])
         g = strat.setdefault(key, {"legs": [], "funding": 0.0, "has_funding": False,
                                    "funding_24h": 0.0, "has_funding_24h": False,
-                                   "funding_mtd": 0.0, "has_funding_mtd": False,
-                                   "funding_ytd": 0.0, "has_funding_ytd": False,
                                    "abs_sizes": [], "abs_notionals": []})
         g["legs"].append(f"{p['exchange']}:{p['direction'][:1]}")
         fc = p.get("funding_collected")
@@ -1495,14 +1534,6 @@ def write_to_sheet(results: list) -> None:
         if f24 is not None:
             g["funding_24h"] += f24
             g["has_funding_24h"] = True
-        fmtd = p.get("funding_mtd")
-        if fmtd is not None:
-            g["funding_mtd"] += fmtd
-            g["has_funding_mtd"] = True
-        fytd = p.get("funding_ytd")
-        if fytd is not None:
-            g["funding_ytd"] += fytd
-            g["has_funding_ytd"] = True
         try:
             g["abs_sizes"].append(abs(float(p["size"])))
         except (TypeError, ValueError):
@@ -1518,11 +1549,6 @@ def write_to_sheet(results: list) -> None:
         # estimated by the average of the absolute leg sizes.
         avg_size = sum(g["abs_sizes"]) / len(g["abs_sizes"]) if g["abs_sizes"] else 0.0
         avg_notional = sum(g["abs_notionals"]) / len(g["abs_notionals"]) if g["abs_notionals"] else 0.0
-        # Funding/Notional % and the annualized figure are still driven off
-        # cumulative funding since the strategy's start date (g["funding"]),
-        # not MTD/YTD, since annualizing a partial-month or partial-year
-        # figure against "days since start" would misstate strategies that
-        # didn't start this month/year.
         f_per_notional_pct = (g["funding"] / avg_notional * 100) if avg_notional > 0 else None
 
         # Annualize using the hardcoded strategy start date.
@@ -1539,13 +1565,44 @@ def write_to_sheet(results: list) -> None:
 
         rows.append([
             key, ", ".join(g["legs"]),
-            _fmt_num(g["funding_mtd"]) if g["has_funding_mtd"] else "",
-            _fmt_num(g["funding_ytd"]) if g["has_funding_ytd"] else "",
+            _fmt_num(g["funding"]) if g["has_funding"] else "",
             _fmt_num(g["funding_24h"]) if g["has_funding_24h"] else "",
             _fmt_num(avg_size, 6),
             _fmt_num(f_per_notional_pct, 4) if (f_per_notional_pct is not None and g["has_funding"]) else "",
             start_str or "",
             _fmt_num(ann_pct, 2) if (ann_pct is not None and g["has_funding"]) else "",
+        ])
+
+    # ---- Past Strategies: symbols with MTD/YTD funding activity but no
+    # currently open position at that venue (closed or rolled-off legs).
+    # Grouped by base asset like Active Strategies, but funding-only -- there
+    # is no live size/notional to normalize against, so no annualization. ----
+    closed_strat: dict = {}
+    for r in results:
+        open_syms = {p["symbol"] for p in r["position_rows"]}
+        mtd_dict = r.get("funding_mtd_by_symbol") or {}
+        ytd_dict = r.get("funding_ytd_by_symbol") or {}
+        for sym in set(mtd_dict) | set(ytd_dict):
+            if sym in open_syms:
+                continue
+            fmtd = mtd_dict.get(sym, 0.0)
+            fytd = ytd_dict.get(sym, 0.0)
+            if fmtd == 0.0 and fytd == 0.0:
+                continue
+            key = _strategy_key(sym)
+            entry = closed_strat.setdefault(key, {"venues": set(), "funding_mtd": 0.0, "funding_ytd": 0.0})
+            entry["venues"].add(r["exchange"])
+            entry["funding_mtd"] += fmtd
+            entry["funding_ytd"] += fytd
+
+    rows.append([])
+    rows.append(["Past Strategies (funding activity, no currently open position)"])
+    rows.append(["Strategy", "Venues", "Funding MTD", "Funding YTD"])
+    for key in sorted(closed_strat, key=lambda k: -abs(closed_strat[k]["funding_ytd"])):
+        entry = closed_strat[key]
+        rows.append([
+            key, ", ".join(sorted(entry["venues"])),
+            _fmt_num(entry["funding_mtd"]), _fmt_num(entry["funding_ytd"]),
         ])
 
     rows.append([])
@@ -1561,18 +1618,23 @@ def write_to_sheet(results: list) -> None:
     if MIN_POSITION_USD > 0:
         rows.append(["Small balance filter", f"positions under ${MIN_POSITION_USD:,.0f} notional hidden ({hidden_count} hidden this run); still included in risk math"])
     rows.append(["Strategy note",
-        "Total Funding Collected MTD/YTD = funding events since the start of the current "
-        "calendar month/year (UTC), summed per strategy. Funding/Notional (%) and Funding "
-        "Annualized (%) are still computed from cumulative funding since each strategy's "
-        "hardcoded start date (STRATEGY_START_DATES), not MTD/YTD, so those two figures stay "
-        "meaningful for strategies that didn't start this month or year. 24 Hr Funding = "
-        "funding events in the trailing 24h; Bybit and Lighter legs are excluded from that "
-        "column (no time breakdown available there). Bybit's MTD/YTD figures come from its "
-        "transaction log (a real per-event ledger sum), which is separate from and may not "
-        "exactly match the curRealisedPnl proxy used elsewhere. Lighter has no windowed "
-        "funding available from its public API (lifetime-cumulative only), so Lighter legs "
-        "are excluded from MTD/YTD; strategies with a Lighter leg understate those two "
-        "columns."])
+        "Funding Totals MTD/YTD = funding events since the start of the current calendar "
+        "month/year (UTC), summed across every symbol traded at any account -- including "
+        "symbols with no currently open position. This is a single top-level figure, not "
+        "broken out per strategy. Active Strategies' Total Funding is cumulative funding "
+        "since each strategy's hardcoded start date (STRATEGY_START_DATES); Funding/Notional "
+        "(%) and Funding Annualized (%) are derived from that figure, not from MTD/YTD, so "
+        "they stay meaningful for strategies that didn't start this month or year. 24 Hr "
+        "Funding = funding events in the trailing 24h; Bybit and Lighter legs are excluded "
+        "from that column (no time breakdown available there). Past Strategies lists symbols "
+        "with MTD/YTD funding activity but no currently open position (closed or rolled-off "
+        "legs), so the top-level Funding Totals figure reconciles against Active Strategies' "
+        "24h/since-start numbers plus Past Strategies' MTD/YTD numbers. Bybit's MTD/YTD "
+        "figures (in both Funding Totals and Past Strategies) come from its transaction log "
+        "(a real per-event ledger sum), separate from and not necessarily matching the "
+        "curRealisedPnl proxy used for Active Strategies. Lighter has no windowed funding "
+        "available from its public API (lifetime-cumulative only), so it never contributes "
+        "to Funding Totals or Past Strategies."])
 
     max_cols = max(len(row) for row in rows) if rows else 1
     rows = [row + [""] * (max_cols - len(row)) for row in rows]
