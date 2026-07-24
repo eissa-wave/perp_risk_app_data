@@ -1605,6 +1605,30 @@ def write_to_sheet(results: list) -> None:
             _fmt_num(entry["funding_mtd"]), _fmt_num(entry["funding_ytd"]),
         ])
 
+    # ---- Funding by Leg: the un-aggregated version of the table above -- one
+    # row per (exchange, symbol) with MTD/YTD funding activity in the window,
+    # tagged Open/Closed, whether or not it's a currently open position. Per-
+    # Position Detail above only ever shows currently open legs (it's a live
+    # risk table -- direction/size/liq price don't exist for a closed leg), so
+    # this is the leg-level view for funding history specifically. ----
+    leg_funding_rows = []
+    for r in results:
+        open_syms = {p["symbol"] for p in r["position_rows"]}
+        mtd_dict = r.get("funding_mtd_by_symbol") or {}
+        ytd_dict = r.get("funding_ytd_by_symbol") or {}
+        for sym in set(mtd_dict) | set(ytd_dict):
+            fmtd = mtd_dict.get(sym, 0.0)
+            fytd = ytd_dict.get(sym, 0.0)
+            if fmtd == 0.0 and fytd == 0.0:
+                continue
+            leg_funding_rows.append((r["exchange"], sym, "Open" if sym in open_syms else "Closed", fmtd, fytd))
+
+    rows.append([])
+    rows.append(["Funding by Leg (MTD/YTD, all legs, active + previous)"])
+    rows.append(["Exchange", "Symbol", "Status", "Funding MTD", "Funding YTD"])
+    for exch, sym, status, fmtd, fytd in sorted(leg_funding_rows, key=lambda x: -abs(x[4])):
+        rows.append([exch, sym, status, _fmt_num(fmtd), _fmt_num(fytd)])
+
     rows.append([])
     rows.append(["Thresholds"])
     rows.append(["Liq distance threshold", f">{LIQ_DISTANCE_THRESHOLD_PCT:.0f}%"])
@@ -1635,7 +1659,10 @@ def write_to_sheet(results: list) -> None:
         "log (a real per-event ledger sum), separate from and not necessarily matching the "
         "curRealisedPnl proxy used for Active Strategies. Lighter has no windowed funding "
         "available from its public API (lifetime-cumulative only), so it never contributes "
-        "to Funding Totals or Funding by Strategy."])
+        "to Funding Totals or Funding by Strategy. Funding by Leg is the same MTD/YTD data "
+        "un-aggregated: one row per (exchange, symbol), tagged Open/Closed, whether or not "
+        "it's a currently open position -- use this for the leg-level funding detail that "
+        "Per-Position Detail above can't show for closed legs."])
 
     max_cols = max(len(row) for row in rows) if rows else 1
     rows = [row + [""] * (max_cols - len(row)) for row in rows]
