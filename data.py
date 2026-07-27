@@ -111,13 +111,13 @@ LIGHTER_MGN_RATIO_TARGET = 1.33
 # global FUNDING_START_MS window. Update when entering/rolling a new strategy.
 STRATEGY_START_DATES = {
     # "TICKER": "YYYY-MM-DD",
-    "VVV": "2026-06-10",
     "JTO": "2026-07-10",
     "LIT": "2026-07-10",
     "SPCX": "2026-07-14",
     "BRENT": "2026-07-22",
     "CL" : "2026-07-23",
-    "BEAT" : "2026-07-24"
+    "BEAT" : "2026-07-24",
+    "TSLA" : "2026-07-27"
 }
 
 # Venue-specific tickers that refer to the same underlying strategy but don't
