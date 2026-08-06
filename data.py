@@ -126,7 +126,7 @@ STRATEGY_START_DATES = {
 # Map each raw normalized key to the canonical STRATEGY_START_DATES key so both
 # legs group into one Strategy PnL row. Add future mismatches here.
 STRATEGY_ALIASES = {
-    "BRENTOIL": "BRENT",   # Hyperliquid xyz:xyz:BRENTOIL
+    "BRENTOIL": "BRENT",   # Hyperliquid xyz:BRENTOIL
     "BZ": "BRENT",         # Binance BZUSDT
 }
 
@@ -276,8 +276,16 @@ def _funding_start_for(symbol: str) -> int:
 
 def _hl_funding_by_coin(session, dex: str, start_ms: int, end_ms: int,
                         timeout: int, retries: int, backoff_s: float) -> dict:
-    """Sum HL funding (delta.usdc, positive = received) per coin for one dex,
-    paginating via the last event time. Keyed by raw coin name.
+    """Sum HL funding (delta.usdc, positive = received) per coin, paginating via
+    the last event time. Keyed by raw coin name (already dex-qualified for
+    builder assets, e.g. "xyz:CL"; bare for main-dex assets, e.g. "TRUMP").
+
+    IMPORTANT: HL's userFunding endpoint returns the account's ENTIRE funding
+    history regardless of the dex param (it does not scope by dex), so this must
+    be called exactly ONCE for the whole account. Calling it per dex and
+    re-prefixing the coin name double-counts every event (that was the source of
+    the phantom TRUMP/xyz:TRUMP, xyz:CL/xyz:xyz:CL twin rows). The dex arg is
+    kept only for the payload; pass "" for the single global call.
 
     Pagination re-fetches from the last timestamp inclusive (cur = last_time,
     not last_time + 1) and dedups on (time, coin, usdc) so events sharing the
@@ -506,13 +514,21 @@ def _hl_post(session, payload: dict, timeout: int, retries: int, backoff_s: floa
             time.sleep(backoff_s * (2 ** attempt))
 
 
-def _get_hl_dex_positions(session, dex: str, timeout: int, retries: int, backoff_s: float) -> dict:
-    """Fetch one HL perp dex. dex="" is the main validator-operated dex; a
-    non-empty name is a HIP-3 builder dex with independent margining. Builder-dex
-    symbols are prefixed dex:coin (e.g. xyz:CL) and the account is reported as
-    its own row "Hyperliquid:<dex>" since equity/withdrawable are dex-scoped."""
+def _get_hl_dex_positions(session, dex, funding_by_coin, funding_24h_by_coin,
+                          funding_mtd_by_coin, funding_ytd_by_coin,
+                          timeout, retries, backoff_s):
+    """Fetch one HL perp dex's positions. dex="" is the main validator-operated
+    dex; a non-empty name is a HIP-3 builder dex with independent margining.
+
+    HL returns builder assets fully qualified (e.g. "xyz:CL") and main-dex
+    assets bare (e.g. "TRUMP"), so the raw coin name is used directly as the
+    symbol. (The old code re-prefixed builder coins -> "xyz:xyz:CL"; that plus
+    the per-dex funding double-fetch produced the phantom twin rows.)
+
+    Funding is NOT fetched here: userFunding returns the whole account
+    regardless of dex, so it is fetched ONCE in get_hl_positions and the shared
+    per-coin dicts are passed in and looked up by raw coin name."""
     label = "Hyperliquid" if not dex else f"Hyperliquid:{dex}"
-    prefix = f"{dex}:" if dex else ""
 
     ch_payload = {"type": "clearinghouseState", "user": HL_USER}
     if dex:
@@ -534,17 +550,6 @@ def _get_hl_dex_positions(session, dex: str, timeout: int, retries: int, backoff
         if float(pos.get("szi", "0")) == 0:
             continue
         positions.append(pos)
-
-    try:
-        funding_by_coin, funding_24h_by_coin, funding_mtd_by_coin, funding_ytd_by_coin = _hl_funding_by_coin(
-            session, dex, FUNDING_FETCH_START_MS, _now_ms(), timeout, retries, backoff_s
-        )
-    except Exception as exc:
-        print(f"  [Hyperliquid funding warning] dex={dex or '(main)'}: {exc}")
-        funding_by_coin = None
-        funding_24h_by_coin = None
-        funding_mtd_by_coin = None
-        funding_ytd_by_coin = None
 
     long_delta = short_delta = 0.0
     position_rows = []
@@ -578,7 +583,7 @@ def _get_hl_dex_positions(session, dex: str, timeout: int, retries: int, backoff
             cross_position_inputs.append({"name": coin, "size": szi, "mark": mark_px, "liq": liq_px})
 
         position_rows.append({
-            "exchange": label, "symbol": f"{prefix}{coin}", "direction": direction,
+            "exchange": label, "symbol": coin, "direction": direction,
             "size": abs(szi), "notional": signed_notional, "mark": mark_px,
             "liq": liq_px, "dist_pct": dist_pct, "margin_mode": margin_mode,
             "isolated_removable": iso_rem,
@@ -621,12 +626,11 @@ def _get_hl_dex_positions(session, dex: str, timeout: int, retries: int, backoff
         "net_delta": net_delta, "gross_notional": gross_notional, "leverage": hl_leverage,
         "account_equity": account_equity, "withdrawable": withdrawable,
         "excess_collateral": excess, "removable_total": removable_total, "mgn_ratio": None,
-        # Full per-symbol MTD/YTD funding for this dex, across every coin that
-        # had funding activity in the window -- NOT limited to currently open
-        # positions. Used for the top-level Funding Totals figure and the
-        # Funding by Strategy table (closed/rolled-off legs still show up here).
-        "funding_mtd_by_symbol": {f"{prefix}{c}": v for c, v in (funding_mtd_by_coin or {}).items()},
-        "funding_ytd_by_symbol": {f"{prefix}{c}": v for c, v in (funding_ytd_by_coin or {}).items()},
+        # Set once by the caller from the single global funding fetch (unified
+        # mode), or partitioned by native dex prefix (non-unified fallback).
+        # Populated here as empty so the shape is stable.
+        "funding_mtd_by_symbol": {},
+        "funding_ytd_by_symbol": {},
         # raw components for the unified-mode combiner (stripped before sheet write)
         "_iso_removables": isolated_removables,
         "_cross_inputs": cross_position_inputs,
@@ -637,12 +641,16 @@ def _get_hl_dex_positions(session, dex: str, timeout: int, retries: int, backoff
     }
 
 
-def _get_hl_unified(session, per_dex: list, timeout: int, retries: int, backoff_s: float) -> dict:
+def _get_hl_unified(session, per_dex, funding_mtd_by_coin, funding_ytd_by_coin,
+                    timeout, retries, backoff_s):
     """Combine per-dex results into one unified-account row. In unified mode a
     single USDC balance backs spot plus all cross perps on every dex, so equity,
     leverage, withdrawable, and removable are computed against the unified
     balance, not the per-dex margin allocations. Isolated positions (e.g.
-    xyz:CL) keep their own ring-fenced margin and are unaffected by the mode."""
+    xyz:CL) keep their own ring-fenced margin and are unaffected by the mode.
+
+    Funding is attached ONCE from the single global fetch (keyed by raw coin),
+    never summed per dex -- that was the double-count."""
     spot = _hl_post(session, {"type": "spotClearinghouseState", "user": HL_USER},
                     timeout, retries, backoff_s)
     usdc_total = 0.0
@@ -660,8 +668,6 @@ def _get_hl_unified(session, per_dex: list, timeout: int, retries: int, backoff_
     cross_inputs = []
     long_delta = short_delta = 0.0
     total_upl = 0.0
-    funding_mtd_by_symbol: dict = {}
-    funding_ytd_by_symbol: dict = {}
     for r in per_dex:
         for row in r["position_rows"]:
             row = dict(row)
@@ -672,10 +678,6 @@ def _get_hl_unified(session, per_dex: list, timeout: int, retries: int, backoff_
         long_delta += r["long_delta"]
         short_delta += r["short_delta"]
         total_upl += r.get("_upl", 0.0)
-        for k, v in r.get("funding_mtd_by_symbol", {}).items():
-            funding_mtd_by_symbol[k] = funding_mtd_by_symbol.get(k, 0.0) + v
-        for k, v in r.get("funding_ytd_by_symbol", {}).items():
-            funding_ytd_by_symbol[k] = funding_ytd_by_symbol.get(k, 0.0) + v
 
     net_delta = long_delta + short_delta
     gross_notional = long_delta + abs(short_delta)
@@ -711,23 +713,41 @@ def _get_hl_unified(session, per_dex: list, timeout: int, retries: int, backoff_
         "net_delta": net_delta, "gross_notional": gross_notional, "leverage": hl_leverage,
         "account_equity": account_equity, "withdrawable": withdrawable,
         "excess_collateral": excess, "removable_total": removable_total, "mgn_ratio": None,
-        "funding_mtd_by_symbol": funding_mtd_by_symbol,
-        "funding_ytd_by_symbol": funding_ytd_by_symbol,
+        # Single global fetch, keyed by raw already-qualified coin -- no dup.
+        "funding_mtd_by_symbol": dict(funding_mtd_by_coin or {}),
+        "funding_ytd_by_symbol": dict(funding_ytd_by_coin or {}),
     }
 
 
 def get_hl_positions():
     """Standard mode: one result dict per dex (independent margining).
     Unified mode (HL_UNIFIED): one combined dict computed against the unified
-    USDC balance."""
+    USDC balance.
+
+    Funding is fetched ONCE for the whole account (userFunding ignores the dex
+    param and returns everything), keyed by raw already-qualified coin. This
+    replaces the old per-dex funding fetch, which double-counted every event."""
     timeout, retries, backoff_s = 20, 5, 0.4
     session = requests.Session()
     session.headers.update({"Content-Type": "application/json"})
 
+    try:
+        (funding_by_coin, funding_24h_by_coin,
+         funding_mtd_by_coin, funding_ytd_by_coin) = _hl_funding_by_coin(
+            session, "", FUNDING_FETCH_START_MS, _now_ms(), timeout, retries, backoff_s
+        )
+    except Exception as exc:
+        _log(f"  [Hyperliquid funding warning] global fetch failed: {exc}")
+        funding_by_coin = funding_24h_by_coin = funding_mtd_by_coin = funding_ytd_by_coin = None
+
     per_dex = []
     for dex in HL_DEXS:
         try:
-            r = _get_hl_dex_positions(session, dex, timeout, retries, backoff_s)
+            r = _get_hl_dex_positions(
+                session, dex, funding_by_coin, funding_24h_by_coin,
+                funding_mtd_by_coin, funding_ytd_by_coin,
+                timeout, retries, backoff_s,
+            )
         except Exception as exc:
             _log(f"  [Hyperliquid dex={dex or '(main)'} ERROR] {type(exc).__name__}: {exc}")
             continue
@@ -736,12 +756,44 @@ def get_hl_positions():
 
     if HL_UNIFIED:
         try:
-            return [_get_hl_unified(session, per_dex, timeout, retries, backoff_s)]
+            return [_get_hl_unified(
+                session, per_dex, funding_mtd_by_coin, funding_ytd_by_coin,
+                timeout, retries, backoff_s,
+            )]
         except Exception as exc:
             _log(f"  [Hyperliquid unified ERROR] {type(exc).__name__}: {exc}; "
                  "falling back to per-dex rows")
 
-    # strip private fields before returning per-dex rows
+    # Non-unified fallback: the global funding dicts are keyed by raw coin
+    # (bare = main dex, "xyz:..." = builder dex). Partition them by each coin's
+    # native dex prefix so each per-dex row gets only its own coins and nothing
+    # double-counts. Coins from a fully-closed builder dex that isn't present in
+    # per_dex fold into the main row so top-level totals stay complete.
+    builder_dexs = [d for d in HL_DEXS if d]
+
+    def _coin_dex(coin):
+        for d in builder_dexs:
+            if coin.startswith(d + ":"):
+                return d
+        return ""
+
+    present = set()
+    for r in per_dex:
+        lbl = r["exchange"]
+        present.add("" if lbl == "Hyperliquid" else lbl.split(":", 1)[1])
+
+    for r in per_dex:
+        lbl = r["exchange"]
+        rdex = "" if lbl == "Hyperliquid" else lbl.split(":", 1)[1]
+        for field, src in (("funding_mtd_by_symbol", funding_mtd_by_coin),
+                           ("funding_ytd_by_symbol", funding_ytd_by_coin)):
+            sub = {}
+            for c, v in (src or {}).items():
+                cd = _coin_dex(c)
+                if cd == rdex or (rdex == "" and cd not in present):
+                    sub[c] = v
+            r[field] = sub
+
     for r in per_dex:
         for k in ("_iso_removables", "_cross_inputs", "_upl"):
             r.pop(k, None)
@@ -1427,8 +1479,8 @@ def _strategy_key(symbol: str) -> str:
     """Normalize a venue symbol to its base asset so legs of the same funding-arb
     strategy group together. Examples:
       VVVUSDT -> VVV, XMRUSDT -> XMR, VVV -> VVV,
-      xyz:xyz:CL -> CL, CL-USDT-SWAP -> CL,
-      xyz:xyz:BRENTOIL -> BRENT (alias), BZUSDT -> BZ -> BRENT (alias).
+      xyz:CL -> CL, CL-USDT-SWAP -> CL,
+      xyz:BRENTOIL -> BRENT (alias), BZUSDT -> BZ -> BRENT (alias).
 
     Some venues label the same underlying strategy with different tickers
     (e.g. HL's BRENTOIL vs Binance's BZUSDT). After normalizing venue prefixes
@@ -1716,7 +1768,10 @@ def write_to_sheet(results: list) -> None:
         "every ticker with funding activity in the window, active or fully closed, summed "
         "across every venue it traded on (so e.g. Hyperliquid's BRENTOIL and Binance's "
         "BZUSDT land on one combined BRENT row); summing this table's Funding MTD/YTD "
-        "columns should reconcile to the top-level Funding Totals above. Bybit's MTD/YTD "
+        "columns should reconcile to the top-level Funding Totals above. HL funding is "
+        "fetched once for the whole account (userFunding ignores the dex param and returns "
+        "everything), keyed by raw already-qualified coin -- so each HL leg appears exactly "
+        "once (no TRUMP/xyz:TRUMP twin rows). Bybit's MTD/YTD "
         "figures (in both Funding Totals and Funding by Strategy) come from its transaction "
         "log (a real per-event ledger sum), separate from and not necessarily matching the "
         "curRealisedPnl proxy used for Active Strategies. Lighter has no windowed funding "
