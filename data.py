@@ -115,7 +115,8 @@ STRATEGY_START_DATES = {
     "SPCX": "2026-07-14",
     "BRENT": "2026-07-22",
     "CL" : "2026-07-23",
-    "TSLA" : "2026-07-27"
+    "TSLA" : "2026-07-27",
+    "SILVER" : "2026-08-06"
 }
 
 # Venue-specific tickers that refer to the same underlying strategy but don't
