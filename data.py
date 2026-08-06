@@ -112,11 +112,9 @@ LIGHTER_MGN_RATIO_TARGET = 1.33
 STRATEGY_START_DATES = {
     # "TICKER": "YYYY-MM-DD",
     "JTO": "2026-07-10",
-    "LIT": "2026-07-10",
     "SPCX": "2026-07-14",
     "BRENT": "2026-07-22",
     "CL" : "2026-07-23",
-    "BEAT" : "2026-07-24",
     "TSLA" : "2026-07-27"
 }
 
@@ -128,6 +126,8 @@ STRATEGY_START_DATES = {
 STRATEGY_ALIASES = {
     "BRENTOIL": "BRENT",   # Hyperliquid xyz:BRENTOIL
     "BZ": "BRENT",         # Binance BZUSDT
+    "SILVER": "XAG",       # Hyperliquid xyz:SILVER -> canonical XAG
+    "XAG": "XAG",          # explicit self-map (any XAG* venue ticker)
 }
 
 
@@ -1480,7 +1480,8 @@ def _strategy_key(symbol: str) -> str:
     strategy group together. Examples:
       VVVUSDT -> VVV, XMRUSDT -> XMR, VVV -> VVV,
       xyz:CL -> CL, CL-USDT-SWAP -> CL,
-      xyz:BRENTOIL -> BRENT (alias), BZUSDT -> BZ -> BRENT (alias).
+      xyz:BRENTOIL -> BRENT (alias), BZUSDT -> BZ -> BRENT (alias),
+      xyz:SILVER -> SILVER -> XAG (alias), XAGUSDT -> XAG (alias).
 
     Some venues label the same underlying strategy with different tickers
     (e.g. HL's BRENTOIL vs Binance's BZUSDT). After normalizing venue prefixes
