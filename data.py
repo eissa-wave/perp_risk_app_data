@@ -95,6 +95,12 @@ LIGHTER_ACCOUNT_INDEX = os.environ.get("LIGHTER_ACCOUNT_INDEX")
 # Same framing as OKX/Binance: account equity / maintenance margin requirement.
 LIGHTER_MGN_RATIO_FLOOR = 1.5
 LIGHTER_MGN_RATIO_TARGET = 1.33
+# Public market list (symbol -> market_index) and per-market funding-rate
+# history, used to ESTIMATE Lighter 24h funding (see _lighter_funding_24h_*).
+# The account API only exposes lifetime-cumulative funding, so 24h has to be
+# reconstructed from the market rate times notional. Overridable via env.
+LIGHTER_MARKETS_URL = os.environ.get("LIGHTER_MARKETS_URL", "https://explorer.elliot.ai/api/markets")
+LIGHTER_FUNDING_URL = os.environ.get("LIGHTER_FUNDING_URL", LIGHTER_BASE_URL.rstrip("/") + "/api/v1/fundings")
 
 # ============================================================
 #  STRATEGY START DATES (hardcoded, by base ticker)
@@ -986,15 +992,24 @@ def _bybit_txlog_pages(acct_type: str, params_base: dict, timeout_s: int = 10):
             break
 
 
-def _bybit_funding_mtd_ytd(timeout_s: int = 10) -> tuple:
-    """Sum Bybit SETTLEMENT funding per symbol for the MTD and YTD windows via
-    the transaction log, chunked into 7-day windows (the endpoint caps query
-    range at 7 days). This is a real per-event ledger sum, kept separate from
-    the curRealisedPnl proxy used for the "Total Funding" per-position field
-    elsewhere, since curRealisedPnl has no timestamp/window breakdown."""
+def _bybit_funding_windows(timeout_s: int = 10) -> tuple:
+    """Sum Bybit SETTLEMENT funding per symbol for the trailing 24h, MTD and YTD
+    windows via the transaction log, chunked into 7-day windows (the endpoint
+    caps query range at 7 days). This is a real per-event ledger sum, kept
+    separate from the curRealisedPnl proxy used for the per-position "Total
+    Funding" field elsewhere, since curRealisedPnl has no timestamp/window
+    breakdown.
+
+    The 24h bucket is derived from the same events as MTD/YTD (the transaction
+    log carries transactionTime), so Bybit legs are no longer excluded from the
+    24 Hr Funding column -- this is an exact ledger figure, not an estimate.
+
+    Returns (totals_24h, totals_mtd, totals_ytd)."""
+    totals_24h: dict = {}
     totals_mtd: dict = {}
     totals_ytd: dict = {}
     end_ms = _now_ms()
+    cutoff_24h = end_ms - 86_400_000
     for acct_type in ("UNIFIED", "CONTRACT"):
         got_any = False
         for c_start, c_end in _chunks(YTD_START_MS, end_ms, 7 * 86_400_000):
@@ -1017,12 +1032,14 @@ def _bybit_funding_mtd_ytd(timeout_s: int = 10) -> tuple:
                         totals_ytd[sym] = totals_ytd.get(sym, 0.0) + f
                     if ts >= MTD_START_MS:
                         totals_mtd[sym] = totals_mtd.get(sym, 0.0) + f
+                    if ts >= cutoff_24h:
+                        totals_24h[sym] = totals_24h.get(sym, 0.0) + f
             except RuntimeError as exc:
-                print(f"  [Bybit funding MTD/YTD warning] {acct_type}: {exc}")
+                print(f"  [Bybit funding windows warning] {acct_type}: {exc}")
                 break
         if got_any:
             break
-    return totals_mtd, totals_ytd
+    return totals_24h, totals_mtd, totals_ytd
 
 
 def _bybit_fetch_wallet(timeout=10):
@@ -1061,9 +1078,10 @@ def get_bybit_positions():
                 break
 
     try:
-        funding_mtd_by_symbol, funding_ytd_by_symbol = _bybit_funding_mtd_ytd()
+        funding_24h_by_symbol, funding_mtd_by_symbol, funding_ytd_by_symbol = _bybit_funding_windows()
     except Exception as exc:
-        print(f"  [Bybit funding MTD/YTD warning] {exc}")
+        print(f"  [Bybit funding windows warning] {exc}")
+        funding_24h_by_symbol = None
         funding_mtd_by_symbol = None
         funding_ytd_by_symbol = None
 
@@ -1110,7 +1128,9 @@ def get_bybit_positions():
 
         # NOTE: Bybit position objects expose curRealisedPnl (cumulative realized
         # PnL for the current position: funding + closed PnL + fees), not isolated
-        # funding. Unlike the other venues this is a proxy, not pure funding.
+        # funding. Unlike the other venues this is a proxy, not pure funding. The
+        # 24h/MTD/YTD funding figures come from the transaction log instead (real
+        # per-event settlement funding), so funding_24h is now populated for Bybit.
         try:
             cur_rpnl = float(p.get("curRealisedPnl") or 0)
         except (TypeError, ValueError):
@@ -1121,7 +1141,7 @@ def get_bybit_positions():
             "size": size, "notional": signed_notional, "mark": mark, "liq": liq_px,
             "dist_pct": dist_pct, "margin_mode": margin_mode, "isolated_removable": iso_rem,
             "funding_collected": cur_rpnl,
-            "funding_24h": None,  # curRealisedPnl proxy has no 24h breakdown
+            "funding_24h": funding_24h_by_symbol.get(symbol, 0.0) if funding_24h_by_symbol is not None else None,
             "funding_mtd": funding_mtd_by_symbol.get(symbol, 0.0) if funding_mtd_by_symbol is not None else None,
             "funding_ytd": funding_ytd_by_symbol.get(symbol, 0.0) if funding_ytd_by_symbol is not None else None,
         })
@@ -1312,6 +1332,79 @@ def get_okx_positions():
     }
 
 
+def _lighter_market_index_map(timeout: int = 15) -> dict:
+    """symbol (upper) -> market_index from the public market list. Used only to
+    resolve a Lighter position's market for the 24h funding-rate estimate."""
+    r = requests.get(LIGHTER_MARKETS_URL, timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, dict):
+        data = data.get("markets") or data.get("data") or data.get("result") or []
+    out = {}
+    for m in data or []:
+        sym = m.get("symbol")
+        idx = m.get("market_index")
+        if sym is None or idx is None:
+            continue
+        try:
+            out[str(sym).upper()] = int(idx)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _lighter_signed_funding_rate_sum_24h(market_index: int, end_ms: int,
+                                         timeout: int = 15) -> float:
+    """Sum the last 24h of a Lighter market's hourly funding rate, returned in
+    STANDARD convention (positive = longs pay shorts).
+
+    The public /api/v1/fundings endpoint gives the market rate, not the
+    account's realized funding, so this feeds an ESTIMATE (rate x notional),
+    not a ledger figure. Rate is percent; an optional `direction` field carries
+    the sign (long = longs pay = positive), matching the carry scanner's
+    handling. Raises on request/parse failure so the caller can fall back to
+    None rather than emit a wrong number."""
+    start_ms = end_ms - 86_400_000
+    r = requests.get(
+        LIGHTER_FUNDING_URL,
+        params={
+            "market_id": int(market_index), "resolution": "1h",
+            "start_timestamp": start_ms, "end_timestamp": end_ms,
+            "count_back": 48,
+        },
+        headers={"accept": "application/json"},
+        timeout=timeout,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, dict):
+        rows = data.get("fundings") or data.get("data") or data.get("result") or []
+    else:
+        rows = data or []
+
+    signed_sum = 0.0
+    for row in rows:
+        ts = row.get("timestamp")
+        rate = row.get("rate")
+        if ts is None or rate is None:
+            continue
+        try:
+            ts_ms = int(ts) * 1000  # endpoint returns seconds (see carry scanner)
+        except (TypeError, ValueError):
+            continue
+        if ts_ms < start_ms or ts_ms > end_ms:
+            continue
+        try:
+            signed = float(rate) / 100.0  # percent -> decimal
+        except (TypeError, ValueError):
+            continue
+        direction = row.get("direction")
+        if direction in ("long", "short"):
+            signed *= 1.0 if direction == "long" else -1.0
+        signed_sum += signed
+    return signed_sum
+
+
 def get_lighter_positions():
     """Lighter is a zk-rollup orderbook perp DEX. Account/position data is
     public (GET /api/v1/account?by=index&value=<account index>), so unlike
@@ -1324,17 +1417,22 @@ def get_lighter_positions():
     same floor/target margin-ratio framing is reused here.
 
     NOTE ON FUNDING: the public account endpoint only exposes lifetime-
-    cumulative funding per position (total_funding_paid_out). Windowed or
-    24h funding requires a signed auth token (the positionFunding endpoint),
-    which needs the Lighter SDK's signer and is out of scope for a read-only
-    monitor. So funding_collected below is lifetime, NOT clipped to
-    STRATEGY_START_DATES like the other venues, and funding_24h/funding_mtd
-    are always None -- see the "Strategy note" row in the sheet. funding_ytd
-    is populated as lifetime-cumulative too: this is EXACT as long as the
-    position has accrued no funding before Jan 1 of the current year, which
-    holds for every position opened this year (true for all mapped
-    strategies today), but would overstate YTD for a position with funding
-    history stretching back to a prior year.
+    cumulative funding per position (total_funding_paid_out). Windowed MTD
+    funding requires a signed auth token (the positionFunding endpoint), which
+    needs the Lighter SDK's signer and is out of scope for a read-only monitor.
+    So funding_collected below is lifetime, NOT clipped to STRATEGY_START_DATES
+    like the other venues, and funding_mtd is always None -- see the "Strategy
+    note" row in the sheet. funding_ytd is populated as lifetime-cumulative too:
+    this is EXACT as long as the position has accrued no funding before Jan 1 of
+    the current year, which holds for every position opened this year (true for
+    all mapped strategies today), but would overstate YTD for a position with
+    funding history stretching back to a prior year.
+
+    funding_24h is a RATE-DERIVED ESTIMATE: the public per-market hourly funding
+    rate over the last 24h (standard convention, positive = longs pay) times the
+    position notional, signed by direction. It is an approximation, not a ledger
+    figure, and degrades to None on any fetch/parse failure so the monitor never
+    emits a wrong number silently.
     """
     if not LIGHTER_ACCOUNT_INDEX:
         _log("  Lighter: LIGHTER_ACCOUNT_INDEX not set, skipping.")
@@ -1401,10 +1499,33 @@ def get_lighter_positions():
             "size": size, "notional": signed_notional, "mark": mark, "liq": liq_px,
             "dist_pct": dist_pct, "margin_mode": margin_mode, "isolated_removable": iso_rem,
             "funding_collected": _f(funding_life) if funding_life is not None else None,
-            "funding_24h": None,  # lifetime-cumulative only; see docstring
+            "funding_24h": None,  # filled below with a rate-derived estimate
             "funding_mtd": None,  # not available without the SDK signer; see docstring
             "funding_ytd": None,  # not available without the SDK signer; see docstring
         })
+
+    # ---- 24h funding estimate (rate x notional; see docstring) ----
+    # Resolve each open Lighter position's market once, pull the last 24h of the
+    # market's hourly funding rate, and multiply by notional signed by position
+    # direction. account received = -dir_sign * signed_rate_sum * notional
+    # (long pays when rate > 0). Best-effort: any failure leaves funding_24h None.
+    end_ms = _now_ms()
+    try:
+        mkt_map = _lighter_market_index_map(timeout=timeout)
+    except Exception as exc:
+        _log(f"  [Lighter 24h warning] market list fetch failed: {exc}")
+        mkt_map = {}
+    for row in position_rows:
+        mi = mkt_map.get((row["symbol"] or "").upper())
+        if mi is None:
+            continue
+        try:
+            signed_rate_sum = _lighter_signed_funding_rate_sum_24h(mi, end_ms, timeout=timeout)
+        except Exception as exc:
+            _log(f"  [Lighter 24h warning] {row['symbol']}: {exc}")
+            continue
+        dir_sign = 1.0 if row["direction"] == "LONG" else -1.0
+        row["funding_24h"] = -dir_sign * signed_rate_sum * abs(row["notional"])
 
     net_delta = long_delta + short_delta
     gross_notional = long_delta + abs(short_delta)
@@ -1445,7 +1566,7 @@ def get_lighter_positions():
         "account_equity": account_equity, "withdrawable": withdrawable,
         "excess_collateral": excess, "removable_total": removable_total,
         "mgn_ratio": mgn_ratio if mgn_ratio != float("inf") else None,
-        # No windowed funding available (lifetime-cumulative only, see
+        # No windowed ledger funding available (lifetime-cumulative only, see
         # docstring), so MTD is never populated. YTD uses lifetime-cumulative
         # as an exact proxy for positions with no funding history before this
         # year -- see docstring caveat.
@@ -1764,32 +1885,38 @@ def write_to_sheet(results: list) -> None:
         "broken out per strategy. Active Strategies' Total Funding is cumulative funding "
         "since each strategy's hardcoded start date (STRATEGY_START_DATES), aggregated only "
         "over currently open legs; Funding/Notional (%) and Funding Annualized (%) are "
-        "derived from that figure, not from MTD/YTD. 24 Hr Funding = funding events in the "
-        "trailing 24h; Bybit and Lighter legs are excluded from that column (no time "
-        "breakdown available there). Funding by Strategy is a flat MTD/YTD breakdown for "
-        "every ticker with funding activity in the window, active or fully closed, summed "
-        "across every venue it traded on (so e.g. Hyperliquid's BRENTOIL and Binance's "
-        "BZUSDT land on one combined BRENT row); summing this table's Funding MTD/YTD "
-        "columns should reconcile to the top-level Funding Totals above. HL funding is "
-        "fetched once for the whole account (userFunding ignores the dex param and returns "
-        "everything), keyed by raw already-qualified coin -- so each HL leg appears exactly "
-        "once (no TRUMP/xyz:TRUMP twin rows). Bybit's MTD/YTD "
+        "derived from that figure, not from MTD/YTD. 24 Hr Funding = funding over the "
+        "trailing 24h, summed across both legs. Hyperliquid, Binance and OKX 24h are exact "
+        "ledger sums (userFunding / income / bills). Bybit 24h is now also an exact ledger "
+        "sum, taken from its transaction log (same source as its MTD/YTD, SETTLEMENT type). "
+        "Lighter has no windowed account-funding API, so its 24h is a RATE-DERIVED ESTIMATE: "
+        "the public per-market hourly funding rate over the last 24h times position notional, "
+        "signed by direction (positive market rate = longs pay); treat it as approximate, not "
+        "a ledger figure, and it drops to blank if the rate fetch fails. Funding by Strategy "
+        "is a flat MTD/YTD breakdown for every ticker with funding activity in the window, "
+        "active or fully closed, summed across every venue it traded on (so e.g. "
+        "Hyperliquid's BRENTOIL and Binance's BZUSDT land on one combined BRENT row); summing "
+        "this table's Funding MTD/YTD columns should reconcile to the top-level Funding "
+        "Totals above. HL funding is fetched once for the whole account (userFunding ignores "
+        "the dex param and returns everything), keyed by raw already-qualified coin -- so "
+        "each HL leg appears exactly once (no TRUMP/xyz:TRUMP twin rows). Bybit's MTD/YTD "
         "figures (in both Funding Totals and Funding by Strategy) come from its transaction "
         "log (a real per-event ledger sum), separate from and not necessarily matching the "
-        "curRealisedPnl proxy used for Active Strategies. Lighter has no windowed funding "
-        "API (lifetime-cumulative only); its YTD figure uses lifetime-cumulative funding as "
-        "an exact proxy (valid as long as the position has no funding history before this "
-        "calendar year -- true for every position opened this year), but Lighter never "
-        "contributes an MTD figure, and a fully closed Lighter position loses its funding "
-        "history entirely (the public API only reports currently-held positions). Funding by "
-        "Leg is the same MTD/YTD data un-aggregated: one row per (exchange, symbol), tagged "
-        "Open/Closed, whether or not it's a currently open position -- use this for the "
-        "leg-level funding detail that Per-Position Detail above can't show for closed legs. "
-        "Data Gaps flags every currently open position where no meaningful MTD/YTD funding "
-        "was captured (key absent or summing to exactly zero) -- this is what actually causes "
-        "a leg to look thin or missing above; common causes are Lighter's MTD limitation, an "
-        "OKX/Bybit leg booked as a dated future/spot/margin position (no periodic funding "
-        "exists for those instrument types), or a genuine fetch gap against the exchange API."])
+        "curRealisedPnl proxy used for Active Strategies' Total Funding. Lighter has no "
+        "windowed funding API (lifetime-cumulative only); its YTD figure uses lifetime-"
+        "cumulative funding as an exact proxy (valid as long as the position has no funding "
+        "history before this calendar year -- true for every position opened this year), but "
+        "Lighter never contributes an MTD figure, and a fully closed Lighter position loses "
+        "its funding history entirely (the public API only reports currently-held positions). "
+        "Funding by Leg is the same MTD/YTD data un-aggregated: one row per (exchange, "
+        "symbol), tagged Open/Closed, whether or not it's a currently open position -- use "
+        "this for the leg-level funding detail that Per-Position Detail above can't show for "
+        "closed legs. Data Gaps flags every currently open position where no meaningful "
+        "MTD/YTD funding was captured (key absent or summing to exactly zero) -- this is what "
+        "actually causes a leg to look thin or missing above; common causes are Lighter's MTD "
+        "limitation, an OKX/Bybit leg booked as a dated future/spot/margin position (no "
+        "periodic funding exists for those instrument types), or a genuine fetch gap against "
+        "the exchange API."])
 
     max_cols = max(len(row) for row in rows) if rows else 1
     rows = [row + [""] * (max_cols - len(row)) for row in rows]
