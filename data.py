@@ -123,7 +123,7 @@ STRATEGY_START_DATES = {
     "TSLA" : "2026-07-27",
     "XAG" : "2026-08-06",
     "UB" : "2026-08-07",
-    "KAITO" : "2026-08-10"
+    "XMR" : "2026-08-12"
 }
 
 # Venue-specific tickers that refer to the same underlying strategy but don't
