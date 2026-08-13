@@ -195,7 +195,7 @@ FUNDING_FETCH_START_MS = min(FUNDING_START_MS, YTD_START_MS)
 # the sheet (Per-Position Detail and Strategy PnL legs). They still count in
 # the fetchers' risk math (equity, deltas, removable). Env override
 # MIN_POSITION_USD; set 0 to show everything.
-MIN_POSITION_USD = float(os.environ.get("MIN_POSITION_USD", "300"))
+MIN_POSITION_USD = float(os.environ.get("MIN_POSITION_USD", "1000"))
 
 GSHEET_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
