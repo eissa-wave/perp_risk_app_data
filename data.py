@@ -122,9 +122,9 @@ STRATEGY_START_DATES = {
     "BRENT": "2026-07-22",
     "TSLA" : "2026-07-27",
     "XAG" : "2026-08-06",
-    "UB" : "2026-08-07",
     "XMR" : "2026-08-12",
-    "ADA" : "2026-08-14"
+    "ADA" : "2026-08-14",
+    "FARTCOIN" : "2026-08-17"
 }
 
 # Venue-specific tickers that refer to the same underlying strategy but don't
