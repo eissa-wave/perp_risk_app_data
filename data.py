@@ -124,7 +124,8 @@ STRATEGY_START_DATES = {
     "XAG" : "2026-08-06",
     "XMR" : "2026-08-12",
     "ADA" : "2026-08-14",
-    "FARTCOIN" : "2026-08-17"
+    "FARTCOIN" : "2026-08-17",
+    "GOLD" : "2026-08-19"
 }
 
 # Venue-specific tickers that refer to the same underlying strategy but don't
@@ -136,7 +137,8 @@ STRATEGY_ALIASES = {
     "BRENTOIL": "BRENT",   # Hyperliquid xyz:BRENTOIL
     "BZ": "BRENT",         # Binance BZUSDT
     "SILVER": "XAG",       # Hyperliquid xyz:SILVER -> canonical XAG
-    "XAG": "XAG",          # explicit self-map (any XAG* venue ticker)
+    "XAG": "XAG",
+    "XAU": "GOLD"
 }
 
 
